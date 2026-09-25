@@ -21,11 +21,13 @@ Supported means the subset described here, not full Windows equivalence.
 | 9 | `CertGetStoreProperty`, `CertSetStoreProperty` | Localized name and application properties `0x8000..0xffff`. |
 | 11 | `CertSaveStore` | Unsigned certificate-only PKCS#7 export to memory; two-call size-query convention. Other output formats/targets fail. |
 | 12 | `CertControlStore` | Immediate SQLite persistence and commit flush; native resync; unsupported controls fail. |
+| 13 | `CertEnumSystemStore`, `CertEnumSystemStoreLocation` | User/computer locations, predefined ROOT/CA/MY and persisted custom-store names; callback early termination. |
 | 16 | `PFXImportCertStore` | Single-key or certificate-only authenticated PKCS#12; creates a persistent import store with PEM certificates and filesystem-protected PKCS#8 key files. |
 
 `GetLastError`, `SetLastError`, `SysCertGetLastErrorMessage` and
 `SysCertUpdateTrustAnchor`, `SysCertImportPfxToStore`, and
-`SysCertGetCertificateFilePath` complete the error/native/file integration surface.
+`SysCertGetCertificateFilePath`, `SysCertGetCertificateStoreLocation`, and
+`SysCertConfigureSystemStores` complete the error/native/file/scope integration surface.
 
 ### Detailed compatibility limits
 
@@ -69,6 +71,18 @@ Supported means the subset described here, not full Windows equivalence.
   files. Copying a certificate context to a persistent logical store also copies
   its associated key into a new protected object directory; this implementation
   does not emulate Windows non-exportable key policy.
+- User/computer scopes have separate backing metadata. Standard `ROOT`, `CA`
+  and `MY` exist logically before their first write. User ROOT/CA include
+  read-only inherited machine entries; MY does not inherit. Adds target the
+  selected scope's own backing store. Inherited deletion, property modification
+  and key access are denied; modify the computer store explicitly instead.
+  Searches, issuer lookups and PKCS#7 export include inherited entries. Local
+  and inherited duplicate memberships are both enumerated, local first.
+- Computer certificate files and metadata are readable independently of keys.
+  New computer object directories use `0755`, certificate/metadata files `0644`,
+  key directories `0700` and key files `0600`. Private-key files are opened
+  lazily only for operations requiring them. Existing restrictive permissions
+  are preserved. Linux filesystem permissions still control access.
 - Native ROOT is a de-duplicated TLS-bundle snapshot, read-only unless explicitly
   opened with `SYS_CERT_STORE_NATIVE_WRITE_FLAG`. Add/delete then update native
   sources and regenerate trust. Local root files are physically deleted;
@@ -78,16 +92,21 @@ Supported means the subset described here, not full Windows equivalence.
   stores do not implicitly become system trust. Read errors fail the whole
   load; failed resync leaves the previous snapshot unchanged.
 - SQLite open supports read-only, existing-only, create-new, and archived
-  enumeration. Read-only opens require an existing file. Native resync rejects
+  enumeration. Explicit SQLite read-only opens require an existing file;
+  standard system stores may be logically empty with no metadata file yet.
+  Native/inherited-view resync rejects
   outstanding contexts rather than changing row identity underneath them.
 - PFX import supports zero or one matching private key plus certificates.
   Integrity checks and password validation are required; unsupported bags and
-  multiple keys are rejected. `0`, `CRYPT_EXPORTABLE`, `CRYPT_USER_KEYSET`, or
-  their supported combination are accepted; machine-keyset and no-persist flags
-  are not implemented. Filesystem permission protection, not at-rest encryption,
+  multiple keys are rejected. `0`, `CRYPT_EXPORTABLE`, and either
+  `CRYPT_USER_KEYSET` or `CRYPT_MACHINE_KEYSET` are supported. Combining both
+  keyset flags is an error. The explicit-destination import extension rejects
+  a keyset flag contradicting the destination scope. No-persist flags are not
+  implemented. Filesystem permission protection, not at-rest encryption,
   was selected for private keys. Private-key properties, CSP/KSP handles and
   private-key acquisition remain unimplemented.
-- `PFXImportCertStore` deliberately creates a persistent user import store,
+- `PFXImportCertStore` deliberately creates a persistent user import store by
+  default, or a computer import store for `CRYPT_MACHINE_KEYSET`,
   unlike the Windows returned memory store. Close preserves its certificate/key
   files. For predictable placement, use `SysCertImportPfxToStore` on an explicit
   file-backed store. It imports the entire supported PFX in one metadata
@@ -102,10 +121,10 @@ Supported means the subset described here, not full Windows equivalence.
 | 10 | `CertAddStoreToCollection`, `CertRemoveStoreFromCollection` | Priority traversal, write routing, sibling lifetime and collection provider. |
 | 11 | Remaining `CertSaveStore` modes | File targets and Windows serialized stores/elements. |
 | 12 | Remaining `CertControlStore` controls | Provider notifications and additional flag semantics. |
-| 13 | `CertEnumSystemStore`, `CertEnumSystemStoreLocation`, `CertEnumPhysicalStore` | Callback contracts, locations and physical-store model. |
+| 13 | `CertEnumPhysicalStore` and additional locations | Physical-store callbacks, service/remote/group-policy/enterprise locations. |
 | 14 | `CertRegisterSystemStore`, `CertUnregisterSystemStore`, `CertRegisterPhysicalStore`, `CertUnregisterPhysicalStore` | Persistent registration and Windows-compatible callback structures. |
 | 15 | `CertAddSerializedElementToStore`, `CertSerializeCertificateStoreElement` | Interoperable Windows element format, properties, context-type dispatch. |
-| 16 | Remaining `PFXImportCertStore` behavior | Multiple keys, machine-keyset/no-persist flags, bag-attribute mapping and Windows key-provider policies. |
+| 16 | Remaining `PFXImportCertStore` behavior | Multiple keys, no-persist flags, bag-attribute mapping and Windows key-provider policies. |
 | 17 | `CertAddCRLContextToStore`, `CertAddCRLLinkToStore`, `CertAddEncodedCRLToStore`, `CertDeleteCRLFromStore` | CRL context/storage/link ownership. |
 | 17 | `CertEnumCRLsInStore`, `CertFindCRLInStore`, `CertGetCRLFromStore`, `CertSerializeCRLStoreElement` | CRL query, matching, issuer/revocation and serialization rules. |
 | 17 | `CertGetCRLContextProperty`, `CertSetCRLContextProperty`, `CertEnumCRLContextProperties` | CRL property model. |
@@ -120,6 +139,11 @@ The practical-core list in section 19 groups the above APIs; it is not a
 separate set of exports.
 
 ## Portability status
+
+The [certutil CLI](../tools/certutil/README.md) exposes the implemented store
+operations and uses OpenSSL for public certificate formats and encrypted PFX
+export. CLI export does not imply that the Windows `PFXExportCertStoreEx` library
+API, Windows key providers, or full certutil command coverage is implemented.
 
 Ubuntu 24.04 WSL is the initial exercised environment. The CI workflow also
 targets Red Hat UBI 9 and Azure Linux 3 containers. These jobs establish
@@ -136,4 +160,5 @@ Windows behavioral conformance from passing Linux tests alone.
 - [Find semantics](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certfindcertificateinstore)
 - [Context property semantics](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certsetcertificatecontextproperty)
 - [Close and context ownership](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certclosestore)
+- [Windows system-store locations and physical siblings](https://learn.microsoft.com/en-us/windows/win32/seccrypto/system-store-locations)
 - [Azure Linux CA package layout](https://github.com/microsoft/azurelinux/blob/3.0/SPECS/ca-certificates/ca-certificates.spec)

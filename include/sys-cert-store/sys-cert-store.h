@@ -12,7 +12,18 @@ struct SYS_CERT_NATIVE_OPTIONS {
 inline constexpr DWORD SYS_CERT_TRUST_UPDATE_ALLOW = 1;
 inline constexpr DWORD SYS_CERT_STORE_NATIVE_WRITE_FLAG = 0x10000000;
 
+struct SYS_CERT_STORE_CONFIGURATION {
+    DWORD cbSize;
+    const char* userStoreDirectory;
+    const char* machineStoreDirectory;
+    const char* systemRoot;
+};
+
 extern "C" {
+// Process-wide path relocation; pass nullptr to reset. All stores/contexts must be closed.
+// This changes paths, not the process identity or filesystem permissions.
+BOOL SysCertConfigureSystemStores(const SYS_CERT_STORE_CONFIGURATION* configuration) noexcept;
+BOOL SysCertGetCertificateStoreLocation(PCCERT_CONTEXT certificate, DWORD* location) noexcept;
 // Thread-local diagnostic, valid until the next failure or SetLastError on this thread.
 const char* SysCertGetLastErrorMessage() noexcept;
 // Explicit native mutation: removes local anchors and disables/distrusts matching vendor roots.

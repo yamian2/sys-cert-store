@@ -23,12 +23,12 @@ certificate DER/PEM or private-key contents. Everything survives process restart
 | Store | Backing storage |
 | --- | --- |
 | `CERT_STORE_PROV_MEMORY` | Temporary C++ certificate/key objects and in-memory metadata; no files |
-| Current-user named stores (`MY`, `CA`, or another logical name) | `<effective-user-home>/.local/share/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
+| Current-user named stores (`ROOT`, `CA`, `MY`, or another logical name) | `<effective-user-home>/.local/share/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
 | Local-machine named stores other than `ROOT` | `/var/lib/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
-| `ROOT`, at either supported location | Snapshot of native TLS trust; opt-in writes modify distro sources and regenerate trust |
+| Computer `ROOT` | Snapshot of native TLS trust; opt-in writes modify distro sources and regenerate trust |
 | `SYS_CERT_STORE_PROV_SQLITE` | Caller-selected absolute metadata filename, plus adjacent `<filename>.objects/` |
 
-For example, importing into `MY` creates:
+For example, importing into current-user `MY` creates:
 
 ```text
 MY.db                            # metadata only
@@ -38,8 +38,13 @@ MY.db.objects/
     private-key.pem              # only when the import contains a matching key
 ```
 
-Object directories use mode `0700`; certificate, private-key and new database
-files use `0600`. Certificate files are flushed before metadata commits.
+User/explicit-store object directories use mode `0700`; certificate, private-key
+and new database files use `0600`. Computer stores expose certificate files and
+metadata with `0644` and their directories with `0755`, while private keys remain
+`0600` inside a separate `0700` `keys/` directory. Certificate enumeration never
+opens private keys. Copying a key or requesting its path requires access to that
+protected file. Do not place secrets in computer-store properties.
+Certificate files are flushed before metadata commits.
 Deletion removes the certificate **and its corresponding private-key file**.
 A metadata garbage queue retries interrupted post-commit deletions when the
 store is next opened writable. A crash before a new object's metadata commit
@@ -57,18 +62,61 @@ The distro layout is used for native roots. Properties must not contain private-
 PKCS#12 imports preserve a matching private key and all certificates in the
 bundle. `SysCertImportPfxToStore` imports directly into a chosen persistent
 logical store. `PFXImportCertStore` returns a newly created persistent
-`IMPORT-<id>.db` store in the current user's library directory, unlike Windows'
+`IMPORT-<id>.db` store in the user's library directory by default or the computer
+directory with `CRYPT_MACHINE_KEYSET`, unlike Windows'
 temporary returned certificate store. Closing it does not delete its files.
 `SysCertGetCertificateFilePath` returns the certificate or key filename.
 Multi-key PFX files and unsupported bag types fail rather than dropping material.
 An import containing certificates alone cannot produce private keys.
 
-`ROOT` exposes system TLS trust, not every certificate found somewhere below
+Computer `ROOT` exposes system TLS trust, not every certificate found somewhere below
 `/etc`. Loading only the distro's generated bundle respects which anchors the
 distro includes for TLS. This is not a full representation of p11-kit
-purpose-specific trust or distrust metadata. Current-user `ROOT` currently
-exposes the same native snapshot as local-machine `ROOT`, without a per-user
-overlay.
+purpose-specific trust or distrust metadata.
+
+## User and computer stores
+
+`ROOT`, `CA` (Windows' intermediate-certification-authorities store), and `MY`
+(personal certificates) are predefined in both scopes, even before metadata
+files exist. Read-only or existing-only opens of these empty standard stores
+work without creating files. Metadata and object directories are created on the
+first write. Custom store names are persisted separately.
+
+| Logical view | Entries visible | Destination of adds/imports |
+| --- | --- | --- |
+| Current-user `ROOT` | User roots, then inherited computer roots | User root files and metadata only |
+| Current-user `CA` | User intermediates, then inherited computer intermediates | User CA files and metadata only |
+| Current-user `MY` | User personal certificates only | User MY files and metadata |
+| Computer `ROOT` | Distro-native trusted roots | Native trust sources, with explicit write opt-in |
+| Computer `CA` / `MY` | That computer store's certificates | Computer store files and metadata |
+
+The current user is the effective Linux UID, not an environment-supplied name.
+Different accounts have different user metadata directories. User changes never
+modify computer trust: inherited entries are read-only through the user view.
+To remove a machine root, explicitly open computer `ROOT` with native-write
+permission. To remove a user root, delete its user-origin context normally.
+Deleting a local duplicate does not remove an inherited copy. `CA` and `MY`
+membership does not make a certificate a native trusted root.
+
+Search, issuer lookup and PKCS#7 export see the same inherited view as
+enumeration. `SysCertGetCertificateStoreLocation` reports an entry's origin;
+an inherited context's `hCertStore` still identifies the user view for continued
+enumeration. Inherited views do not expose computer private keys. User roots
+are visible to library consumers, **not automatically to unrelated Linux TLS
+applications**. There is no modification of the machine CA bundle for user trust.
+
+`CertEnumSystemStoreLocation` enumerates the two locations;
+`CertEnumSystemStore` enumerates standard and persisted custom store names for
+the selected scope. The intermediate store's actual Win32 name is `CA`, not
+`Intermediate`. `CertOpenSystemStoreA/W` selects current-user scope.
+
+`SysCertConfigureSystemStores` can relocate user metadata, computer metadata and
+the native system root for isolated fixtures or application deployments. All
+stores and contexts must be closed before reconfiguration; null resets defaults.
+Relocation does not impersonate a user, elevate privileges or sandbox native
+update executables. Existing computer files created with earlier private-only
+permissions retain those restrictions; the library does not silently loosen
+permissions on existing stores.
 
 | Distro family | Authoritative TLS bundle | Local anchor directory | Update utility |
 | --- | --- | --- | --- |
@@ -128,17 +176,48 @@ Optional sanitizers:
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DSYS_CERT_STORE_SANITIZERS=ON && cmake --build build-asan -j && ctest --test-dir build-asan --output-on-failure
 ```
 
-`list-certificates` reads the actual native ROOT snapshot without changing it.
+`list-certificates` reads current-user ROOT, including inherited native roots,
+without changing trust.
 The test executable uses generated certificates and disposable directories
 under `/tmp`. It exercises persistence in a separate executable process,
 reference ownership, dispositions, properties, searches, PKCS#7 export, all
-distro layouts, explicit trust-write gating, and updater-failure rollback.
+distro layouts, user/computer inheritance and isolation, private-key permissions,
+explicit trust-write gating, and updater-failure rollback. When run as root, it
+also drops privileges in a child process to verify public computer certificates
+are readable without exposing their private keys.
 Native write fixtures use disposable trees. On Ubuntu, the vendor-root test
 also invokes the installed `update-ca-certificates` with **all** certificate,
 configuration, output and hook directories redirected to its fixture tree.
 No test changes the machine's active trust.
 
 ## Use
+
+### Command-line tool
+
+The build includes [`tools/certutil`](tools/certutil/README.md), a Windows-style
+certificate-store CLI. Run `build/tools/certutil/certutil -?` for help. It supports
+store enumeration, certificate display, PEM/DER/PKCS#7 import/export, deletion,
+and password-protected PFX import/export. It defaults to **computer** scope;
+`-user` selects the current user's stores.
+
+```sh
+build/tools/certutil/certutil -user -store MY
+```
+
+```sh
+build/tools/certutil/certutil -user -addstore CA intermediate.pem
+```
+
+```sh
+build/tools/certutil/certutil -user -importPFX MY identity.pfx
+```
+
+PFX commands prompt for a password without echoing it, or accept
+`--password-file` for automation. Computer ROOT writes additionally require
+`--allow-native-write`; the tool never elevates privileges. This is **not NSS
+certutil**: use the full executable path when both are installed.
+
+### Library
 
 ```cpp
 #include <sys-cert-store/sys-cert-store.h>
@@ -177,7 +256,7 @@ The `_A` APIs accept UTF-8, not a Windows ANSI code page.
 
 ## Explicit native trust changes
 
-Native ROOT is read-only by default. Explicitly enable writes when opening it:
+Computer/native ROOT is read-only by default. Explicitly enable writes when opening it:
 
 ```cpp
 HCERTSTORE roots = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
@@ -247,7 +326,7 @@ Calls are serialized within a process; SQLite coordinates independent database
 connections/processes with a five-second busy timeout. Callers still own context
 lifetimes and must not free a context concurrently with code using its fields.
 
-CRLs, CTLs, collections, link semantics, Windows serialization,
+CRLs, CTLs, general-purpose collections, link semantics, Windows serialization,
 CNG/KSP bridging, registration callbacks and complete Win32 flag coverage
 are planned, **not implemented or silently emulated**. Unsupported options in
 implemented functions fail explicitly. Future functions are not declared as

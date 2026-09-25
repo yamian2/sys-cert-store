@@ -52,6 +52,10 @@ struct CERT_CONTEXT {
 };
 using PCERT_CONTEXT = CERT_CONTEXT*;
 using PCCERT_CONTEXT = const CERT_CONTEXT*;
+struct CERT_SYSTEM_STORE_INFO { DWORD cbSize; };
+using PCERT_SYSTEM_STORE_INFO = CERT_SYSTEM_STORE_INFO*;
+using PFN_CERT_ENUM_SYSTEM_STORE = BOOL (*)(const void*, DWORD, PCERT_SYSTEM_STORE_INFO, void*, void*);
+using PFN_CERT_ENUM_SYSTEM_STORE_LOCATION = BOOL (*)(LPCWSTR, DWORD, void*, void*);
 
 inline constexpr DWORD X509_ASN_ENCODING = 1;
 inline constexpr DWORD PKCS_7_ASN_ENCODING = 0x10000;
@@ -144,6 +148,10 @@ HCERTSTORE CertOpenStore(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY lega
                         DWORD flags, const void* parameter) noexcept;
 HCERTSTORE CertOpenSystemStoreW(HCRYPTPROV_LEGACY legacy, LPCWSTR name) noexcept;
 HCERTSTORE CertOpenSystemStoreA(HCRYPTPROV_LEGACY legacy, LPCSTR name) noexcept;
+BOOL CertEnumSystemStore(DWORD flags, void* locationParameter, void* argument,
+    PFN_CERT_ENUM_SYSTEM_STORE callback) noexcept;
+BOOL CertEnumSystemStoreLocation(DWORD flags, void* argument,
+    PFN_CERT_ENUM_SYSTEM_STORE_LOCATION callback) noexcept;
 HCERTSTORE CertDuplicateStore(HCERTSTORE store) noexcept;
 BOOL CertCloseStore(HCERTSTORE store, DWORD flags) noexcept;
 PCCERT_CONTEXT CertCreateCertificateContext(DWORD encoding, const BYTE* encoded, DWORD size) noexcept;

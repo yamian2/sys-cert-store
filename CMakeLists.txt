@@ -24,12 +24,14 @@ endif()
 
 add_executable(list-certificates examples/list-certificates.cpp)
 target_link_libraries(list-certificates PRIVATE sys-cert-store)
+add_subdirectory(tools)
 
 if(BUILD_TESTING)
     add_executable(store-tests tests/store-tests.cpp)
     target_link_libraries(store-tests PRIVATE sys-cert-store OpenSSL::Crypto SQLite::SQLite3 Threads::Threads)
     target_compile_options(store-tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME store-tests COMMAND store-tests)
+    add_test(NAME certutil-tests COMMAND store-tests --certutil $<TARGET_FILE:certutil>)
 endif()
 
 install(TARGETS sys-cert-store EXPORT sys-cert-store-targets

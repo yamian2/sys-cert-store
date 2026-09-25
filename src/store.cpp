@@ -20,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <pwd.h>
 #include <string_view>
 #include <sys/stat.h>
@@ -31,6 +32,12 @@ namespace {
 thread_local DWORD last_error = 0;
 thread_local std::array<char, 1024> last_message{};
 std::recursive_mutex api_mutex;
+struct SystemPaths {
+    std::filesystem::path user;
+    std::filesystem::path machine = "/var/lib/sys-cert-store";
+    std::filesystem::path root = "/";
+};
+SystemPaths system_paths;
 
 void report(DWORD code, const char* message) noexcept {
     last_error = code;
@@ -200,6 +207,11 @@ struct Store {
     bool archived = false;
     bool native = false;
     NativeLayout layout{};
+    DWORD location = 0;
+    std::string name;
+    std::filesystem::path pending_path;
+    bool public_material = false;
+    std::vector<std::shared_ptr<Store>> inherited;
     std::filesystem::path objects;
     std::map<sqlite3_int64, Material> memory;
     std::size_t references = 1;
@@ -217,7 +229,9 @@ struct Context {
     Properties properties;
     SharedKey private_key;
     std::filesystem::path object_path;
+    std::filesystem::path key_path;
     std::shared_ptr<Store> store;
+    std::shared_ptr<Store> view;
     sqlite3_int64 row = 0;
     std::size_t references = 1;
 
@@ -309,7 +323,10 @@ struct Context {
         info.rgExtension = extensions.data();
         pub = {X509_ASN_ENCODING, der.data(), count(der.size()), &info, nullptr};
     }
-    ~Context() { if (store) --store->contexts; }
+    ~Context() {
+        if (store) --store->contexts;
+        if (view) --view->contexts;
+    }
 };
 
 std::unordered_map<HCERTSTORE, std::shared_ptr<Store>> stores;
@@ -334,11 +351,14 @@ struct Consume {
     ~Consume() { if (context) release(context); }
 };
 
-PCCERT_CONTEXT publish(std::unique_ptr<Context> context, std::shared_ptr<Store> store = {}, sqlite3_int64 row = 0) {
+PCCERT_CONTEXT publish(std::unique_ptr<Context> context, std::shared_ptr<Store> store = {}, sqlite3_int64 row = 0,
+    std::shared_ptr<Store> view = {}) {
     auto* result = &context->pub;
     context->store = std::move(store);
     if (context->store) ++context->store->contexts;
-    context->pub.hCertStore = context->store.get();
+    context->view = std::move(view);
+    if (context->view) ++context->view->contexts;
+    context->pub.hCertStore = context->view ? context->view.get() : context->store.get();
     context->row = row;
     contexts.emplace(result, std::move(context));
     return result;
@@ -357,13 +377,15 @@ std::filesystem::path object_directory(const Store& store, const std::string& id
         ERROR_INVALID_DATA, "Invalid object reference in metadata");
     return store.objects / id;
 }
-void private_directory(const std::filesystem::path& path) {
-    if (mkdir(path.c_str(), 0700) != 0)
+void private_directory(const std::filesystem::path& path, bool shared = false) {
+    if (mkdir(path.c_str(), shared ? 0755 : 0700) == 0) {
+        if (shared) require(chmod(path.c_str(), 0755) == 0, ERROR_ACCESS_DENIED, "Cannot set public object-directory permissions");
+    } else
         require(errno == EEXIST, ERROR_ACCESS_DENIED, "Cannot create private object directory");
     struct stat status{};
     require(lstat(path.c_str(), &status) == 0 && S_ISDIR(status.st_mode) &&
-        status.st_uid == geteuid() && (status.st_mode & 077) == 0,
-        ERROR_ACCESS_DENIED, "Object directory must be private, non-symlink and owned by the current user");
+        status.st_uid == geteuid() && (status.st_mode & (shared ? 022 : 077)) == 0,
+        ERROR_ACCESS_DENIED, "Object directory has unsafe ownership or permissions");
 }
 void flush_directory(const std::filesystem::path& path) {
     int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -381,6 +403,12 @@ void erase_object(const std::filesystem::path& path) {
     require(S_ISDIR(status.st_mode) && status.st_uid == geteuid(), ERROR_ACCESS_DENIED, "Unsafe retired object directory");
     std::filesystem::remove(path / "certificate.pem");
     std::filesystem::remove(path / "private-key.pem");
+    auto keys = path / "keys";
+    if (lstat(keys.c_str(), &status) == 0) {
+        require(S_ISDIR(status.st_mode) && status.st_uid == geteuid(), ERROR_ACCESS_DENIED, "Unsafe private-key directory");
+        std::filesystem::remove(keys / "private-key.pem");
+        std::filesystem::remove(keys);
+    } else require(errno == ENOENT, ERROR_GEN_FAILURE, "Cannot inspect private-key directory");
     require(std::filesystem::remove(path), ERROR_GEN_FAILURE, "Cannot remove retired object directory");
     flush_directory(path.parent_path());
 }
@@ -409,12 +437,17 @@ void retire_row(Store& store, sqlite3_int64 row) {
 
 struct CloseFile { void operator()(FILE* file) const { std::fclose(file); } };
 using FileHandle = std::unique_ptr<FILE, CloseFile>;
-FileHandle open_material_file(const std::filesystem::path& path, bool write) {
-    int fd = open(path.c_str(), (write ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW, 0600);
+FileHandle open_material_file(const std::filesystem::path& path, bool write, bool shared = false) {
+    int fd = open(path.c_str(), (write ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW, shared ? 0644 : 0600);
     require(fd >= 0, errno == EACCES ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE, "Cannot open certificate/key object file");
+    if (write && shared && fchmod(fd, 0644) != 0) {
+        close(fd);
+        throw Error(ERROR_ACCESS_DENIED, "Cannot set public certificate-file permissions");
+    }
     struct stat status{};
     bool safe = fstat(fd, &status) == 0 && S_ISREG(status.st_mode) && status.st_nlink == 1 &&
-        status.st_uid == geteuid() && (status.st_mode & 077) == 0;
+        (status.st_uid == geteuid() || (shared && status.st_uid == 0)) &&
+        (status.st_mode & (shared ? 022 : 077)) == 0;
     if (!safe) { close(fd); throw Error(ERROR_ACCESS_DENIED, "Object file must be private, regular and owned by the current user"); }
     FILE* file = fdopen(fd, write ? "wb" : "rb");
     if (!file) { close(fd); throw Error(ERROR_GEN_FAILURE, "Cannot open object file stream"); }
@@ -439,20 +472,28 @@ struct NewObject {
 std::string create_object(Store& store, Context& source, NewObject& pending) {
     auto id = object_id();
     auto directory = object_directory(store, id);
-    require(mkdir(directory.c_str(), 0700) == 0, ERROR_GEN_FAILURE, "Cannot create certificate object directory");
+    require(mkdir(directory.c_str(), store.public_material ? 0755 : 0700) == 0, ERROR_GEN_FAILURE, "Cannot create certificate object directory");
     pending.path = directory;
+    if (store.public_material)
+        require(chmod(directory.c_str(), 0755) == 0, ERROR_ACCESS_DENIED, "Cannot set public certificate-directory permissions");
     {
-        auto file = open_material_file(pending.path / "certificate.pem", true);
+        auto file = open_material_file(pending.path / "certificate.pem", true, store.public_material);
         require(PEM_write_X509(file.get(), source.certificate.get()) == 1, ERROR_GEN_FAILURE, "Cannot encode certificate file");
         flush_file(file.get());
     }
     if (source.private_key) {
         require(X509_check_private_key(source.certificate.get(), source.private_key.get()) == 1,
             ERROR_INVALID_DATA, "Private key does not match certificate");
-        auto file = open_material_file(pending.path / "private-key.pem", true);
+        auto key_directory = pending.path;
+        if (store.public_material) {
+            key_directory /= "keys";
+            private_directory(key_directory);
+        }
+        auto file = open_material_file(key_directory / "private-key.pem", true);
         require(PEM_write_PKCS8PrivateKey(file.get(), source.private_key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1,
             ERROR_GEN_FAILURE, "Cannot encode PKCS#8 key file");
         flush_file(file.get());
+        if (store.public_material) flush_directory(key_directory);
     }
     flush_directory(pending.path);
     flush_directory(store.objects);
@@ -472,25 +513,35 @@ std::unique_ptr<Context> load_context(Store& store, sqlite3_int64 row) {
     auto directory = object_directory(store, query.text_column(0));
     struct stat status{};
     require(lstat(directory.c_str(), &status) == 0 && S_ISDIR(status.st_mode) &&
-        status.st_uid == geteuid() && (status.st_mode & 077) == 0, ERROR_ACCESS_DENIED, "Unsafe certificate object directory");
-    auto file = open_material_file(directory / "certificate.pem", false);
+        (status.st_uid == geteuid() || (store.public_material && status.st_uid == 0)) &&
+        (status.st_mode & (store.public_material ? 022 : 077)) == 0, ERROR_ACCESS_DENIED, "Unsafe certificate object directory");
+    auto file = open_material_file(directory / "certificate.pem", false, store.public_material);
     X509Ptr certificate(PEM_read_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
     require(certificate != nullptr, ERROR_INVALID_DATA, "Invalid certificate PEM object");
     auto result = std::make_unique<Context>(encode_x509(certificate.get()));
     result->object_path = directory;
     auto key_path = directory / "private-key.pem";
-    if (lstat(key_path.c_str(), &status) == 0) {
-        auto key_file = open_material_file(key_path, false);
-        result->private_key.reset(PEM_read_PrivateKey(key_file.get(), nullptr,
-            [](char*, int, int, void*) { return 0; }, nullptr), EVP_PKEY_free);
-        require(result->private_key && X509_check_private_key(result->certificate.get(), result->private_key.get()) == 1,
-            ERROR_INVALID_DATA, "Invalid or mismatched PKCS#8 private-key object");
-    } else require(errno == ENOENT, ERROR_GEN_FAILURE, "Cannot inspect private-key object");
+    if (lstat((directory / "keys").c_str(), &status) == 0) {
+        require(S_ISDIR(status.st_mode), ERROR_ACCESS_DENIED, "Unsafe private-key directory");
+        result->key_path = directory / "keys/private-key.pem";
+    } else {
+        require(errno == ENOENT, ERROR_GEN_FAILURE, "Cannot inspect private-key directory");
+        if (lstat(key_path.c_str(), &status) == 0) result->key_path = key_path;
+        else require(errno == ENOENT, ERROR_GEN_FAILURE, "Cannot inspect private-key object");
+    }
     return result;
+}
+void load_private_key(Context& context) {
+    if (context.private_key || context.key_path.empty()) return;
+    auto file = open_material_file(context.key_path, false);
+    SharedKey key(PEM_read_PrivateKey(file.get(), nullptr, [](char*, int, int, void*) { return 0; }, nullptr), EVP_PKEY_free);
+    require(key && X509_check_private_key(context.certificate.get(), key.get()) == 1,
+        ERROR_INVALID_DATA, "Invalid or mismatched PKCS#8 private-key object");
+    context.private_key = std::move(key);
 }
 
 bool row_exists(Context& context) {
-    if (!context.store || context.store->references == 0) return false;
+    if (!context.store || context.store->references == 0 || (context.view && context.view->references == 0)) return false;
     Statement query(context.store->db->value, "SELECT 1 FROM certificates WHERE id=?");
     query.integer(1, context.row);
     return query.step();
@@ -519,8 +570,10 @@ void write_properties(Store& store, sqlite3_int64 row, const Properties& propert
         insert.step();
     }
 }
-void writable(const Store& store) {
+void materialize(Store& store, bool create = false);
+void writable(Store& store) {
     require(!store.readonly, ERROR_ACCESS_DENIED, "Store is read-only; native stores require explicit SYS_CERT_STORE_NATIVE_WRITE_FLAG");
+    materialize(store, true);
 }
 sqlite3_int64 insert_material(Store& store, Context& source, NewObject& pending) {
     auto object = store.objects.empty() ? std::string{} : create_object(store, source, pending);
@@ -689,27 +742,37 @@ void check_find_type(DWORD type) {
 PCCERT_CONTEXT find(HCERTSTORE handle, DWORD type, const void* parameter, PCCERT_CONTEXT previous) {
     auto store = get_store(handle);
     sqlite3_int64 after = 0;
+    std::vector<std::shared_ptr<Store>> sources{store};
+    sources.insert(sources.end(), store->inherited.begin(), store->inherited.end());
+    std::size_t first = 0;
     if (previous) {
         auto& old = get_context(previous);
-        require(old.store == store, E_INVALIDARG, "Previous context belongs to a different store");
+        require((old.view ? old.view : old.store) == store, E_INVALIDARG, "Previous context belongs to a different store");
+        auto found = std::find(sources.begin(), sources.end(), old.store);
+        require(found != sources.end(), E_INVALIDARG, "Previous context belongs to a removed physical store");
+        first = static_cast<std::size_t>(found - sources.begin());
         after = old.row;
     }
     check_find_type(type);
     require(type == CERT_FIND_ANY || parameter, E_INVALIDARG, "Null search parameter");
-    Statement query(store->db->value, "SELECT id FROM certificates WHERE id>? ORDER BY id");
-    query.integer(1, after);
-    while (query.step()) {
-        auto row = sqlite3_column_int64(query.value, 0);
-        auto candidate = load_context(*store, row);
-        candidate->store = store;
-        ++store->contexts;
-        candidate->row = row;
-        refresh_properties(*candidate);
-        if (type == CERT_FIND_ANY && !store->archived && candidate->properties.contains(CERT_ARCHIVED_PROP_ID)) continue;
-        if (!matches(*candidate, type, parameter)) continue;
-        --store->contexts;
-        candidate->store.reset();
-        return publish(std::move(candidate), store, row);
+    for (std::size_t i = first; i < sources.size(); ++i) {
+        auto source = sources[i];
+        materialize(*source);
+        Statement query(source->db->value, "SELECT id FROM certificates WHERE id>? ORDER BY id");
+        query.integer(1, i == first ? after : 0);
+        while (query.step()) {
+            auto row = sqlite3_column_int64(query.value, 0);
+            auto candidate = load_context(*source, row);
+            candidate->store = source;
+            ++source->contexts;
+            candidate->row = row;
+            refresh_properties(*candidate);
+            if (type == CERT_FIND_ANY && !store->archived && candidate->properties.contains(CERT_ARCHIVED_PROP_ID)) continue;
+            if (!matches(*candidate, type, parameter)) continue;
+            --source->contexts;
+            candidate->store.reset();
+            return publish(std::move(candidate), source, row, i == 0 ? nullptr : store);
+        }
     }
     throw Error(CRYPT_E_NOT_FOUND, "No matching certificate");
 }
@@ -724,6 +787,7 @@ std::string store_name(std::string name) {
     return name;
 }
 std::filesystem::path user_data_directory() {
+    if (!system_paths.user.empty()) return system_paths.user;
     std::array<char, 16384> buffer{};
     passwd entry{};
     passwd* result = nullptr;
@@ -732,7 +796,7 @@ std::filesystem::path user_data_directory() {
     return std::filesystem::path(entry.pw_dir) / ".local/share/sys-cert-store";
 }
 
-std::unique_ptr<Database> open_database(const std::filesystem::path& path, DWORD flags) {
+std::unique_ptr<Database> open_database(const std::filesystem::path& path, DWORD flags, bool shared = false) {
     require(path.is_absolute(), E_INVALIDARG, "SQLite store path must be absolute");
     bool readonly = (flags & CERT_STORE_READONLY_FLAG) != 0;
     bool existing_only = (flags & CERT_STORE_OPEN_EXISTING_FLAG) != 0 || readonly;
@@ -740,8 +804,13 @@ std::unique_ptr<Database> open_database(const std::filesystem::path& path, DWORD
     require(!(existing_only && create_only), E_INVALIDARG, "Conflicting store open flags");
     bool created = false;
     if (!existing_only) {
-        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (fd >= 0) { close(fd); created = true; }
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, shared ? 0644 : 0600);
+        if (fd >= 0) {
+            int permissions = shared ? fchmod(fd, 0644) : 0;
+            close(fd);
+            require(permissions == 0, ERROR_ACCESS_DENIED, "Cannot set public metadata-file permissions");
+            created = true;
+        }
         else if (errno != EEXIST) throw Error(errno == EACCES ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE,
             "Cannot create SQLite store: " + std::string(std::strerror(errno)));
         else require(!create_only, CRYPT_E_EXISTS, "Store already exists");
@@ -753,10 +822,76 @@ std::unique_ptr<Database> open_database(const std::filesystem::path& path, DWORD
 }
 
 void persistent_store(Store& store, const std::filesystem::path& path, DWORD flags) {
-    store.db = open_database(path, flags);
+    store.db = open_database(path, flags, store.public_material);
     store.objects = path.string() + ".objects";
-    if (!store.readonly) private_directory(store.objects);
+    if (!store.readonly) private_directory(store.objects, store.public_material);
     collect_garbage(store);
+}
+
+void materialize(Store& store, bool create) {
+    if (store.pending_path.empty()) return;
+    auto path = store.pending_path;
+    if (std::filesystem::exists(path)) {
+        persistent_store(store, path, store.readonly ? CERT_STORE_READONLY_FLAG : 0);
+        store.pending_path.clear();
+    } else if (create && !store.readonly) {
+        if (std::filesystem::create_directories(path.parent_path()))
+            std::filesystem::permissions(path.parent_path(), store.public_material ?
+                std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+                std::filesystem::perms::others_exec : std::filesystem::perms::owner_all);
+        persistent_store(store, path, 0);
+        store.pending_path.clear();
+    }
+}
+bool standard_store(const std::string& name) {
+    return name == "ROOT" || name == "CA" || name == "MY";
+}
+void scoped_backing(Store& store, const std::filesystem::path& directory, DWORD flags) {
+    auto path = directory / (store.name + ".db");
+    if (!std::filesystem::exists(path) && std::filesystem::exists(directory)) {
+        bool matched = false;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.is_symlink() || !entry.is_regular_file() || entry.path().extension() != ".db") continue;
+            if (store_name(entry.path().stem().string()) != store.name) continue;
+            require(!matched, ERROR_INVALID_DATA, "Multiple metadata files map to the same system-store name");
+            path = entry.path();
+            matched = true;
+        }
+    }
+    bool exists = std::filesystem::exists(path);
+    require(!(standard_store(store.name) && (flags & CERT_STORE_CREATE_NEW_FLAG)), CRYPT_E_EXISTS,
+        "Standard system store already exists");
+    if (!exists && standard_store(store.name)) {
+        store.db = std::make_unique<Database>(":memory:", false, true);
+        store.pending_path = path;
+        return;
+    }
+    if (!exists && !(flags & (CERT_STORE_READONLY_FLAG | CERT_STORE_OPEN_EXISTING_FLAG))) {
+        if (std::filesystem::create_directories(directory))
+            std::filesystem::permissions(directory, store.public_material ?
+                std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+                std::filesystem::perms::others_exec : std::filesystem::perms::owner_all);
+        private_directory(directory, store.public_material);
+    }
+    persistent_store(store, path, flags);
+}
+std::shared_ptr<Store> machine_backing(const std::string& name, DWORD flags) {
+    auto store = std::make_shared<Store>();
+    store->name = name;
+    store->location = CERT_SYSTEM_STORE_LOCAL_MACHINE;
+    store->readonly = (flags & CERT_STORE_READONLY_FLAG) != 0;
+    store->public_material = true;
+    if (name == "ROOT") {
+        store->native = true;
+        store->readonly = !(flags & SYS_CERT_STORE_NATIVE_WRITE_FLAG);
+        auto root = system_paths.root.string();
+        SYS_CERT_NATIVE_OPTIONS options{sizeof(options), root.c_str()};
+        store->layout = native_layout(&options);
+        load_native(*store);
+    } else scoped_backing(*store, system_paths.machine, flags);
+    return store;
 }
 
 HCERTSTORE open_store(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY legacy, DWORD flags, const void* parameter) {
@@ -786,21 +921,18 @@ HCERTSTORE open_store(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY legacy,
         DWORD location = flags & 0xff0000;
         require(location == CERT_SYSTEM_STORE_CURRENT_USER || location == CERT_SYSTEM_STORE_LOCAL_MACHINE,
             ERROR_NOT_SUPPORTED, "Only current-user and local-machine locations are supported");
-        if (name == "ROOT") {
-            require(!(flags & CERT_STORE_CREATE_NEW_FLAG), CRYPT_E_EXISTS, "Native ROOT store already exists");
-            result->native = true;
-            result->readonly = !native_write;
-            result->layout = native_layout(nullptr);
-            load_native(*result);
+        require(!(native_write && (location != CERT_SYSTEM_STORE_LOCAL_MACHINE || name != "ROOT")),
+            E_INVALIDARG, "Native-write flag is only valid for computer ROOT");
+        require(!(standard_store(name) && (flags & CERT_STORE_CREATE_NEW_FLAG)), CRYPT_E_EXISTS, "Standard system store already exists");
+        if (location == CERT_SYSTEM_STORE_LOCAL_MACHINE) {
+            result = machine_backing(name, flags);
+            result->archived = (flags & CERT_STORE_ENUM_ARCHIVED_FLAG) != 0;
         } else {
-            require(!native_write, E_INVALIDARG, "Native-write flag is only valid for ROOT/native stores");
-            auto directory = location == CERT_SYSTEM_STORE_CURRENT_USER ? user_data_directory() :
-                std::filesystem::path("/var/lib/sys-cert-store");
-            if (!(flags & (CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG))) {
-                if (std::filesystem::create_directories(directory))
-                    std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
-            }
-            persistent_store(*result, directory / (name + ".db"), flags);
+            result->name = name;
+            result->location = location;
+            scoped_backing(*result, user_data_directory(), flags);
+            if (name == "ROOT" || name == "CA")
+                result->inherited.push_back(machine_backing(name, CERT_STORE_READONLY_FLAG));
         }
     } else if (id > 0xffff && std::strcmp(provider, SYS_CERT_STORE_PROV_SQLITE) == 0) {
         require(parameter && !(flags & 0xff0000) && !native_write, E_INVALIDARG, "SQLite provider requires an absolute UTF-8 path and no location/native flags");
@@ -817,6 +949,9 @@ HCERTSTORE open_store(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY legacy,
 
 PCCERT_CONTEXT add(Store& store, std::shared_ptr<Store> owner, Context& source, DWORD disposition, bool output) {
     writable(store);
+    require(!source.view || source.key_path.empty(), ERROR_ACCESS_DENIED,
+        "Inherited certificate views do not grant access to machine private keys");
+    load_private_key(source);
     require(disposition >= 1 && disposition <= 7, E_INVALIDARG, "Invalid certificate add disposition");
     refresh_properties(source);
     Transaction transaction(*store.db);
@@ -867,6 +1002,7 @@ PCCERT_CONTEXT add(Store& store, std::shared_ptr<Store> owner, Context& source, 
             retire_row(store, old_row);
         }
         Context material(use_existing ? existing->der : source.der);
+        if (existing && !source.private_key) load_private_key(*existing);
         material.private_key = source.private_key ? source.private_key : (existing ? existing->private_key : SharedKey{});
         row = insert_material(store, material, pending);
     } else if (source.private_key && store.objects.empty()) {
@@ -902,9 +1038,9 @@ void inspect_bags(const STACK_OF(PKCS12_SAFEBAG)* bags, PfxBagCount& count, unsi
     }
 }
 std::vector<std::unique_ptr<Context>> parse_pfx(const CRYPT_DATA_BLOB* blob, LPCWSTR password, DWORD flags) {
-    require(flags == 0 || flags == CRYPT_EXPORTABLE || flags == CRYPT_USER_KEYSET ||
-        flags == (CRYPT_EXPORTABLE | CRYPT_USER_KEYSET), ERROR_NOT_SUPPORTED,
-        "Only user-keyset, filesystem-protected PKCS#12 imports are supported");
+    require((flags & ~(CRYPT_EXPORTABLE | CRYPT_USER_KEYSET | CRYPT_MACHINE_KEYSET)) == 0, ERROR_NOT_SUPPORTED,
+        "Only user/computer-keyset, filesystem-protected PKCS#12 imports are supported");
+    require(!((flags & CRYPT_USER_KEYSET) && (flags & CRYPT_MACHINE_KEYSET)), E_INVALIDARG, "Conflicting PKCS#12 keyset flags");
     require(blob && blob->pbData && blob->cbData, E_INVALIDARG, "Empty PKCS#12 input");
     auto secret = password ? utf8(password) : std::string{};
     struct Cleanse { std::string& value; ~Cleanse() { OPENSSL_cleanse(value.data(), value.size()); } } cleanse{secret};
@@ -988,6 +1124,68 @@ DWORD GetLastError() noexcept { return last_error; }
 void SetLastError(DWORD error) noexcept { report(error, ""); }
 const char* SysCertGetLastErrorMessage() noexcept { return last_message.data(); }
 
+BOOL SysCertConfigureSystemStores(const SYS_CERT_STORE_CONFIGURATION* configuration) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(stores.empty() && contexts.empty(), ERROR_BUSY, "Close all stores and contexts before changing system-store paths");
+        SystemPaths updated;
+        if (configuration) {
+            require(configuration->cbSize == sizeof(*configuration), E_INVALIDARG, "Invalid system-store configuration size");
+            auto path = [](const char* value, const std::filesystem::path& fallback) {
+                if (!value) return fallback;
+                std::filesystem::path result(value);
+                require(result.is_absolute(), E_INVALIDARG, "System-store paths must be absolute");
+                return result.lexically_normal();
+            };
+            updated.user = path(configuration->userStoreDirectory, {});
+            updated.machine = path(configuration->machineStoreDirectory, updated.machine);
+            updated.root = path(configuration->systemRoot, updated.root);
+            require(updated.user.empty() || updated.user != updated.machine, E_INVALIDARG,
+                "User and computer store directories must differ");
+        }
+        system_paths = std::move(updated);
+        return TRUE;
+    });
+}
+BOOL SysCertGetCertificateStoreLocation(PCCERT_CONTEXT certificate, DWORD* location) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(location, E_INVALIDARG, "Missing store-location output");
+        auto& context = get_context(certificate);
+        require(context.store && context.store->location, ERROR_NOT_SUPPORTED, "Context does not belong to a scoped system store");
+        *location = context.store->location;
+        return TRUE;
+    });
+}
+BOOL CertEnumSystemStoreLocation(DWORD flags, void* argument, PFN_CERT_ENUM_SYSTEM_STORE_LOCATION callback) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(flags == 0, ERROR_NOT_SUPPORTED, "System-store location enumeration flags are unsupported");
+        require(callback, E_INVALIDARG, "Missing location enumeration callback");
+        if (!callback(L"CurrentUser", CERT_SYSTEM_STORE_CURRENT_USER, nullptr, argument)) return FALSE;
+        return callback(L"LocalMachine", CERT_SYSTEM_STORE_LOCAL_MACHINE, nullptr, argument) ? TRUE : FALSE;
+    });
+}
+BOOL CertEnumSystemStore(DWORD flags, void* locationParameter, void* argument, PFN_CERT_ENUM_SYSTEM_STORE callback) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(flags == CERT_SYSTEM_STORE_CURRENT_USER || flags == CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            ERROR_NOT_SUPPORTED, "Only current-user and computer store enumeration is supported");
+        require(!locationParameter, ERROR_NOT_SUPPORTED, "Remote and relocated Win32 enumeration parameters are unsupported");
+        require(callback, E_INVALIDARG, "Missing store enumeration callback");
+        std::set<std::string> names{"ROOT", "CA", "MY"};
+        auto directory = flags == CERT_SYSTEM_STORE_CURRENT_USER ? user_data_directory() : system_paths.machine;
+        if (std::filesystem::exists(directory)) {
+            for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+                if (entry.is_symlink() || !entry.is_regular_file() || entry.path().extension() != ".db") continue;
+                names.insert(store_name(entry.path().stem().string()));
+            }
+        }
+        CERT_SYSTEM_STORE_INFO information{sizeof(information)};
+        for (const auto& name : names) {
+            std::wstring wide(name.begin(), name.end());
+            if (!callback(wide.c_str(), flags, &information, nullptr, argument)) return FALSE;
+        }
+        return TRUE;
+    });
+}
+
 HCERTSTORE CertOpenStore(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY legacy, DWORD flags, const void* parameter) noexcept {
     return boundary<HCERTSTORE>(nullptr, [&] { return open_store(provider, encoding, legacy, flags, parameter); });
 }
@@ -1008,7 +1206,7 @@ BOOL CertCloseStore(HCERTSTORE handle, DWORD flags) noexcept {
         if (store->references == 1) {
             for (auto& [key, context] : contexts) {
                 (void)key;
-                if (context->store == store) refresh_properties(*context);
+                if (context->store == store || context->view == store) refresh_properties(*context);
             }
         }
         if (--store->references == 0) stores.erase(handle);
@@ -1097,6 +1295,7 @@ BOOL CertDeleteCertificateFromStore(PCCERT_CONTEXT context) noexcept {
         Consume consume(context);
         auto& source = get_context(context);
         require(source.store != nullptr, E_INVALIDARG, "Certificate does not belong to a store");
+        require(!source.view, ERROR_ACCESS_DENIED, "Inherited computer certificates must be modified through the computer store");
         require(source.store->references != 0, ERROR_INVALID_HANDLE, "Certificate store is closed");
         writable(*source.store);
         snapshot_row(source.store, source.row);
@@ -1119,6 +1318,7 @@ BOOL CertSetCertificateContextProperty(PCCERT_CONTEXT context, DWORD property, D
         require(property != CERT_SHA1_HASH_PROP_ID && property != CERT_SHA256_HASH_PROP_ID && property != CERT_MD5_HASH_PROP_ID,
             ERROR_NOT_SUPPORTED, "Computed certificate hashes cannot be overridden");
         auto& target = get_context(context);
+        require(!target.view, ERROR_ACCESS_DENIED, "Inherited computer certificate properties are read-only in a user view");
         refresh_properties(target);
         auto updated = target.properties;
         if (!data) updated.erase(property);
@@ -1160,6 +1360,7 @@ DWORD CertEnumCertificateContextProperties(PCCERT_CONTEXT context, DWORD previou
 BOOL CertGetStoreProperty(HCERTSTORE handle, DWORD property, void* data, DWORD* size) noexcept {
     return boundary<BOOL>(FALSE, [&] {
         auto store = get_store(handle);
+        materialize(*store);
         require(property == CERT_STORE_LOCALIZED_NAME_PROP_ID ||
             (property >= CERT_FIRST_USER_PROP_ID && property <= CERT_LAST_USER_PROP_ID),
             ERROR_NOT_SUPPORTED, "Unsupported store property");
@@ -1198,9 +1399,16 @@ BOOL CertControlStore(HCERTSTORE handle, DWORD flags, DWORD control, const void*
         auto store = get_store(handle);
         require(flags == 0 && !parameter, ERROR_NOT_SUPPORTED, "Control flags and parameters are unsupported");
         if (control == CERT_STORE_CTRL_RESYNC) {
-            if (store->native) {
+            if (store->native || !store->inherited.empty()) {
                 require(store->contexts == 0, ERROR_BUSY, "Release native contexts before resynchronizing");
-                load_native(*store);
+                if (store->native) load_native(*store);
+                else {
+                    auto replacement = machine_backing(store->name, CERT_STORE_READONLY_FLAG);
+                    store->inherited = {std::move(replacement)};
+                    materialize(*store);
+                }
+            } else {
+                materialize(*store);
             }
         } else if (control == CERT_STORE_CTRL_COMMIT) {
             writable(*store);
@@ -1221,11 +1429,16 @@ BOOL CertSaveStore(HCERTSTORE handle, DWORD encoding, DWORD saveAs, DWORD saveTo
         std::unique_ptr<PKCS7, decltype(&PKCS7_free)> message(PKCS7_new(), PKCS7_free);
         require(message && PKCS7_set_type(message.get(), NID_pkcs7_signed) == 1 &&
             PKCS7_content_new(message.get(), NID_pkcs7_data) == 1, ERROR_GEN_FAILURE, "Cannot create PKCS#7 container");
-        Statement query(store->db->value, "SELECT id FROM certificates ORDER BY id");
-        while (query.step()) {
-            auto certificate = load_context(*store, sqlite3_column_int64(query.value, 0));
-            require(PKCS7_add_certificate(message.get(), certificate->certificate.get()) == 1,
-                ERROR_GEN_FAILURE, "Cannot add certificate to PKCS#7 container");
+        std::vector<std::shared_ptr<Store>> sources{store};
+        sources.insert(sources.end(), store->inherited.begin(), store->inherited.end());
+        for (const auto& source : sources) {
+            materialize(*source);
+            Statement query(source->db->value, "SELECT id FROM certificates ORDER BY id");
+            while (query.step()) {
+                auto certificate = load_context(*source, sqlite3_column_int64(query.value, 0));
+                require(PKCS7_add_certificate(message.get(), certificate->certificate.get()) == 1,
+                    ERROR_GEN_FAILURE, "Cannot add certificate to PKCS#7 container");
+            }
         }
         int size = i2d_PKCS7(message.get(), nullptr);
         require(size > 0, ERROR_GEN_FAILURE, "PKCS#7 encoding failed");
@@ -1249,6 +1462,10 @@ BOOL SysCertUpdateTrustAnchor(PCCERT_CONTEXT certificate, BOOL install, const SY
 BOOL SysCertImportPfxToStore(HCERTSTORE handle, const CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flags) noexcept {
     return boundary<BOOL>(FALSE, [&] {
         auto store = get_store(handle);
+        require(!(flags & CRYPT_MACHINE_KEYSET) || store->location == CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            E_INVALIDARG, "Computer keyset requires a computer-scoped destination store");
+        require(!(flags & CRYPT_USER_KEYSET) || store->location != CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            E_INVALIDARG, "User keyset cannot target a computer store");
         auto parsed = parse_pfx(pfx, password, flags);
         import_pfx(*store, parsed);
         return TRUE;
@@ -1257,11 +1474,18 @@ BOOL SysCertImportPfxToStore(HCERTSTORE handle, const CRYPT_DATA_BLOB* pfx, LPCW
 HCERTSTORE PFXImportCertStore(CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flags) noexcept {
     return boundary<HCERTSTORE>(nullptr, [&] {
         auto parsed = parse_pfx(pfx, password, flags);
-        auto directory = user_data_directory();
+        bool machine = (flags & CRYPT_MACHINE_KEYSET) != 0;
+        auto directory = machine ? system_paths.machine : user_data_directory();
         if (std::filesystem::create_directories(directory))
-            std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+            std::filesystem::permissions(directory, machine ?
+                std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+                std::filesystem::perms::others_exec : std::filesystem::perms::owner_all);
         auto store = std::make_shared<Store>();
-        persistent_store(*store, directory / ("IMPORT-" + object_id() + ".db"), CERT_STORE_CREATE_NEW_FLAG);
+        store->location = machine ? CERT_SYSTEM_STORE_LOCAL_MACHINE : CERT_SYSTEM_STORE_CURRENT_USER;
+        store->name = store_name("IMPORT-" + object_id());
+        store->public_material = machine;
+        persistent_store(*store, directory / (store->name + ".db"), CERT_STORE_CREATE_NEW_FLAG);
         import_pfx(*store, parsed);
         return publish_store(std::move(store));
     });
@@ -1271,8 +1495,10 @@ BOOL SysCertGetCertificateFilePath(PCCERT_CONTEXT certificate, BOOL privateKey, 
         require(privateKey == FALSE || privateKey == TRUE, E_INVALIDARG, "Invalid key-path selector");
         auto& context = get_context(certificate);
         require(!context.object_path.empty(), ERROR_NOT_SUPPORTED, "Context has no logical-store object path");
+        require(!privateKey || !context.view, ERROR_ACCESS_DENIED, "Inherited views do not grant access to machine private keys");
+        if (privateKey) load_private_key(context);
         require(!privateKey || context.private_key, CRYPT_E_NOT_FOUND, "Certificate has no private-key file");
-        auto name = (context.object_path / (privateKey ? "private-key.pem" : "certificate.pem")).string();
+        auto name = (privateKey ? context.key_path : context.object_path / "certificate.pem").string();
         name.push_back('\0');
         copy_out(Bytes(name.begin(), name.end()), path, size);
         return TRUE;

@@ -10,8 +10,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
+#include <grp.h>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -54,6 +57,10 @@ struct TempDir {
         std::filesystem::remove_all(path, error);
         if (error) std::cerr << "Temporary fixture cleanup failed: " << error.message() << '\n';
     }
+};
+struct PrivateUmask {
+    mode_t previous = umask(0077);
+    ~PrivateUmask() { umask(previous); }
 };
 
 void write_file(const std::filesystem::path& path, const std::string& data) {
@@ -101,6 +108,17 @@ Bytes der(X509* certificate) {
     Bytes result(static_cast<std::size_t>(size));
     auto* cursor = result.data();
     CHECK(i2d_X509(certificate, &cursor) == size);
+    return result;
+}
+Bytes pfx_bytes(X509* certificate, EVP_PKEY* private_key) {
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> pfx(
+        PKCS12_create("password", "scope test", private_key, certificate, nullptr, 0, 0, 0, 0, 0), PKCS12_free);
+    CHECK(pfx);
+    int size = i2d_PKCS12(pfx.get(), nullptr);
+    CHECK(size > 0);
+    Bytes result(static_cast<std::size_t>(size));
+    BYTE* cursor = result.data();
+    CHECK(i2d_PKCS12(pfx.get(), &cursor) == size);
     return result;
 }
 std::string pem(X509* certificate) {
@@ -627,11 +645,452 @@ void thread_tests() {
     for (auto& thread : threads) thread.join();
     CHECK(good && GetLastError() == 123);
 }
+
+BOOL collect_stores(const void* name, DWORD, PCERT_SYSTEM_STORE_INFO info, void* reserved, void* argument) {
+    CHECK(info && info->cbSize == sizeof(*info) && !reserved);
+    static_cast<std::set<std::wstring>*>(argument)->insert(static_cast<LPCWSTR>(name));
+    return TRUE;
+}
+BOOL collect_locations(LPCWSTR, DWORD location, void* reserved, void* argument) {
+    CHECK(!reserved);
+    static_cast<std::set<DWORD>*>(argument)->insert(location);
+    return TRUE;
+}
+DWORD location(PCCERT_CONTEXT certificate) {
+    DWORD result = 0;
+    CHECK(SysCertGetCertificateStoreLocation(certificate, &result));
+    return result;
+}
+HCERTSTORE scoped(LPCWSTR name, DWORD scope, DWORD flags = 0) {
+    return CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, scope | flags, name);
+}
+void system_scope_tests() {
+    TempDir temp;
+    auto first_user = (temp.path / "alice").string();
+    auto second_user = (temp.path / "bob").string();
+    auto machine = (temp.path / "computer").string();
+    auto root = (temp.path / "system").string();
+    auto signer = key();
+    auto native_root = make_x509(signer.get(), 41, "Machine Root", true);
+    auto user_root = make_x509(signer.get(), 42, "User Root", true);
+    auto intermediate = make_x509(signer.get(), 43, "Intermediate", true);
+    auto personal = make_x509(signer.get(), 44, "Personal", false);
+    std::wstring computer_import_name;
+    auto bundle = std::filesystem::path(root) / "etc/ssl/certs/ca-certificates.crt";
+    write_file(std::filesystem::path(root) / "etc/os-release", "ID=ubuntu\n");
+    write_file(bundle, pem(native_root.get()));
+    SYS_CERT_STORE_CONFIGURATION configuration{sizeof(configuration), first_user.c_str(), machine.c_str(), root.c_str()};
+    CHECK(SysCertConfigureSystemStores(&configuration));
+    {
+        std::set<DWORD> locations;
+        CHECK(CertEnumSystemStoreLocation(0, &locations, collect_locations));
+        CHECK(locations == std::set<DWORD>({CERT_SYSTEM_STORE_CURRENT_USER, CERT_SYSTEM_STORE_LOCAL_MACHINE}));
+        std::set<std::wstring> names;
+        CHECK(CertEnumSystemStore(CERT_SYSTEM_STORE_CURRENT_USER, nullptr, &names, collect_stores));
+        CHECK(names == std::set<std::wstring>({L"CA", L"MY", L"ROOT"}));
+        CHECK(!std::filesystem::exists(first_user) && !std::filesystem::exists(machine));
+        auto stop = [](const void*, DWORD, PCERT_SYSTEM_STORE_INFO, void*, void*) -> BOOL {
+            SetLastError(1234);
+            return FALSE;
+        };
+        CHECK(!CertEnumSystemStore(CERT_SYSTEM_STORE_CURRENT_USER, nullptr, nullptr, stop));
+        CHECK(GetLastError() == 1234);
+        CHECK(!CertEnumSystemStore(0, nullptr, nullptr, collect_stores));
+        CHECK(GetLastError() == ERROR_NOT_SUPPORTED);
+        CHECK(!scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_CREATE_NEW_FLAG));
+        CHECK(GetLastError() == CRYPT_E_EXISTS);
+        CHECK(!scoped(L"ROOT", CERT_SYSTEM_STORE_CURRENT_USER, SYS_CERT_STORE_NATIVE_WRITE_FLAG));
+        CHECK(GetLastError() == E_INVALIDARG);
+        Store user_my(scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_OPEN_EXISTING_FLAG));
+        Store machine_my(scoped(L"MY", CERT_SYSTEM_STORE_LOCAL_MACHINE));
+        Store user_ca(scoped(L"CA", CERT_SYSTEM_STORE_CURRENT_USER));
+        Store machine_ca(scoped(L"CA", CERT_SYSTEM_STORE_LOCAL_MACHINE));
+        Store user_roots(CertOpenSystemStoreW(0, L"ROOT"));
+        CHECK(!SysCertConfigureSystemStores(nullptr));
+        CHECK(GetLastError() == ERROR_BUSY);
+        CHECK(enumerate(user_my.value) == 0 && enumerate(machine_my.value) == 0 && enumerate(user_ca.value) == 0);
+        CHECK(!std::filesystem::exists(first_user) && !std::filesystem::exists(machine));
+        CHECK(enumerate(user_roots.value) == 1);
+        Certificate source(create(der(personal.get())));
+        Certificate computer_personal(add(machine_my.value, source.value));
+        CHECK(location(computer_personal.value) == CERT_SYSTEM_STORE_LOCAL_MACHINE);
+        CHECK(enumerate(user_my.value) == 0);
+        Certificate user_personal(add(user_my.value, source.value));
+        CHECK(location(user_personal.value) == CERT_SYSTEM_STORE_CURRENT_USER);
+        CHECK(material_path(user_personal.value) != material_path(computer_personal.value));
+        Certificate ca_source(create(der(intermediate.get())));
+        Certificate computer_ca(add(machine_ca.value, ca_source.value));
+        CHECK(enumerate(user_ca.value) == 1);
+        Certificate inherited(CertEnumCertificatesInStore(user_ca.value, nullptr));
+        CHECK(inherited.value->hCertStore == user_ca.value);
+        CHECK(location(inherited.value) == CERT_SYSTEM_STORE_LOCAL_MACHINE);
+        CHECK(material_path(inherited.value) == material_path(computer_ca.value));
+        CRYPT_DATA_BLOB empty{};
+        CHECK(!CertSetCertificateContextProperty(inherited.value, CERT_FIRST_USER_PROP_ID, 0, &empty));
+        CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+        CHECK(!CertDeleteCertificateFromStore(CertDuplicateCertificateContext(inherited.value)));
+        CHECK(GetLastError() == ERROR_ACCESS_DENIED && enumerate(machine_ca.value) == 1);
+        Certificate local_ca(add(user_ca.value, ca_source.value));
+        CHECK(location(local_ca.value) == CERT_SYSTEM_STORE_CURRENT_USER);
+        CHECK(enumerate(user_ca.value) == 2);
+        CHECK(read_file(bundle) == pem(native_root.get()));
+        Certificate local_source(create(der(user_root.get())));
+        Certificate local_root(add(user_roots.value, local_source.value, CERT_STORE_ADD_NEW));
+        CHECK(location(local_root.value) == CERT_SYSTEM_STORE_CURRENT_USER);
+        CHECK(enumerate(user_roots.value) == 2);
+        CHECK(read_file(bundle) == pem(native_root.get()));
+        Certificate machine_root(CertFindCertificateInStore(user_roots.value, X509_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR_W, L"Machine Root", nullptr));
+        CHECK(location(machine_root.value) == CERT_SYSTEM_STORE_LOCAL_MACHINE);
+        CHECK(!CertDeleteCertificateFromStore(CertDuplicateCertificateContext(machine_root.value)));
+        CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+        CRYPT_DATA_BLOB saved{};
+        CHECK(CertSaveStore(user_roots.value, PKCS_7_ASN_ENCODING, CERT_STORE_SAVE_AS_PKCS7,
+            CERT_STORE_SAVE_TO_MEMORY, &saved, 0));
+        Bytes output(saved.cbData);
+        saved.pbData = output.data();
+        CHECK(CertSaveStore(user_roots.value, PKCS_7_ASN_ENCODING, CERT_STORE_SAVE_AS_PKCS7,
+            CERT_STORE_SAVE_TO_MEMORY, &saved, 0));
+        const BYTE* cursor = output.data();
+        std::unique_ptr<PKCS7, decltype(&PKCS7_free)> exported(d2i_PKCS7(nullptr, &cursor, saved.cbData), PKCS7_free);
+        CHECK(exported && sk_X509_num(exported->d.sign->cert) == 2);
+        CHECK(!CertControlStore(user_roots.value, 0, CERT_STORE_CTRL_RESYNC, nullptr));
+        CHECK(GetLastError() == ERROR_BUSY);
+        Store custom(scoped(L"Custom", CERT_SYSTEM_STORE_CURRENT_USER));
+        names.clear();
+        CHECK(CertEnumSystemStore(CERT_SYSTEM_STORE_CURRENT_USER, nullptr, &names, collect_stores));
+        CHECK(names.contains(L"CUSTOM"));
+        CHECK(!names.contains(L"INTERMEDIATE"));
+    }
+    {
+        auto directory = std::filesystem::path(first_user);
+        std::filesystem::rename(directory / "CUSTOM.db", directory / "custom.db");
+        std::filesystem::rename(directory / "CUSTOM.db.objects", directory / "custom.db.objects");
+        Store legacy_name(scoped(L"CUSTOM", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_OPEN_EXISTING_FLAG));
+        CHECK(enumerate(legacy_name.value) == 0);
+    }
+    {
+        PrivateUmask mask;
+        auto encoded = pfx_bytes(personal.get(), signer.get());
+        CRYPT_DATA_BLOB blob{static_cast<DWORD>(encoded.size()), encoded.data()};
+        Store computer_import(PFXImportCertStore(&blob, L"password", CRYPT_MACHINE_KEYSET));
+        std::set<std::wstring> imports;
+        CHECK(CertEnumSystemStore(CERT_SYSTEM_STORE_LOCAL_MACHINE, nullptr, &imports, collect_stores));
+        for (const auto& name : imports) if (name.starts_with(L"IMPORT-")) computer_import_name = name;
+        CHECK(!computer_import_name.empty());
+        Certificate imported(CertEnumCertificatesInStore(computer_import.value, nullptr));
+        CHECK(location(imported.value) == CERT_SYSTEM_STORE_LOCAL_MACHINE);
+        auto key_file = material_path(imported.value, TRUE);
+        auto cert_file = material_path(imported.value);
+        CHECK(key_file.parent_path() == cert_file.parent_path() / "keys");
+        struct stat mode{};
+        CHECK(stat(cert_file.c_str(), &mode) == 0 && (mode.st_mode & 0777) == 0644);
+        CHECK(stat(cert_file.parent_path().c_str(), &mode) == 0 && (mode.st_mode & 0777) == 0755);
+        CHECK(stat(cert_file.parent_path().parent_path().c_str(), &mode) == 0 && (mode.st_mode & 0777) == 0755);
+        CHECK(stat((std::filesystem::path(machine) / (computer_import_name + L".db")).c_str(), &mode) == 0 &&
+            (mode.st_mode & 0777) == 0644);
+        CHECK(stat(key_file.c_str(), &mode) == 0 && (mode.st_mode & 0777) == 0600);
+        CHECK(stat(key_file.parent_path().c_str(), &mode) == 0 && (mode.st_mode & 0777) == 0700);
+        Store computer_ca(scoped(L"CA", CERT_SYSTEM_STORE_LOCAL_MACHINE));
+        CHECK(SysCertImportPfxToStore(computer_ca.value, &blob, L"password", CRYPT_MACHINE_KEYSET));
+        CHECK(!SysCertImportPfxToStore(computer_ca.value, &blob, L"password", CRYPT_USER_KEYSET));
+        CHECK(GetLastError() == E_INVALIDARG);
+        Store user_ca(scoped(L"CA", CERT_SYSTEM_STORE_CURRENT_USER));
+        CHECK(!SysCertImportPfxToStore(user_ca.value, &blob, L"password", CRYPT_MACHINE_KEYSET));
+        CHECK(GetLastError() == E_INVALIDARG);
+        CHECK(!PFXImportCertStore(&blob, L"password", CRYPT_USER_KEYSET | CRYPT_MACHINE_KEYSET));
+        CHECK(GetLastError() == E_INVALIDARG);
+        Store user_import(PFXImportCertStore(&blob, L"password", CRYPT_USER_KEYSET));
+        Certificate user_imported(CertEnumCertificatesInStore(user_import.value, nullptr));
+        CHECK(location(user_imported.value) == CERT_SYSTEM_STORE_CURRENT_USER);
+        CHECK(material_path(user_imported.value, TRUE).parent_path() == material_path(user_imported.value).parent_path());
+        CHECK(stat(material_path(user_imported.value).c_str(), &mode) == 0 && (mode.st_mode & 0777) == 0600);
+        Certificate inherited_key(CertFindCertificateInStore(user_ca.value, X509_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR_W, L"Personal", nullptr));
+        CHECK(location(inherited_key.value) == CERT_SYSTEM_STORE_LOCAL_MACHINE);
+        DWORD size = 0;
+        CHECK(!SysCertGetCertificateFilePath(inherited_key.value, TRUE, nullptr, &size));
+        CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+        CHECK(!CertAddCertificateContextToStore(user_ca.value, inherited_key.value, CERT_STORE_ADD_ALWAYS, nullptr));
+        CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+        auto computer_key = CertFindCertificateInStore(computer_ca.value, X509_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR_W, L"Personal", nullptr);
+        CHECK(computer_key);
+        auto stored_key = material_path(computer_key, TRUE);
+        CHECK(CertDeleteCertificateFromStore(computer_key));
+        CHECK(!std::filesystem::exists(stored_key) && !std::filesystem::exists(stored_key.parent_path()));
+    }
+    configuration.userStoreDirectory = second_user.c_str();
+    CHECK(SysCertConfigureSystemStores(&configuration));
+    {
+        Store user_my(scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_READONLY_FLAG));
+        Store user_ca(scoped(L"CA", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_READONLY_FLAG));
+        Store user_roots(scoped(L"ROOT", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_READONLY_FLAG));
+        CHECK(enumerate(user_my.value) == 0 && enumerate(user_ca.value) == 1 && enumerate(user_roots.value) == 1);
+        CHECK(!std::filesystem::exists(second_user));
+        CHECK(!scoped(L"CUSTOM", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_OPEN_EXISTING_FLAG));
+        CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+        CHECK(CertControlStore(user_roots.value, 0, CERT_STORE_CTRL_RESYNC, nullptr));
+    }
+    configuration.userStoreDirectory = first_user.c_str();
+    CHECK(SysCertConfigureSystemStores(&configuration));
+    {
+        Store user_my(scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER));
+        Store user_ca(scoped(L"CA", CERT_SYSTEM_STORE_CURRENT_USER));
+        Store user_roots(scoped(L"ROOT", CERT_SYSTEM_STORE_CURRENT_USER));
+        CHECK(enumerate(user_my.value) == 1 && enumerate(user_ca.value) == 2 && enumerate(user_roots.value) == 2);
+        auto selected = CertFindCertificateInStore(user_roots.value, X509_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR_W, L"User Root", nullptr);
+        CHECK(selected);
+        auto file = material_path(selected);
+        CHECK(CertDeleteCertificateFromStore(selected));
+        CHECK(!std::filesystem::exists(file));
+        CHECK(enumerate(user_roots.value) == 1 && read_file(bundle) == pem(native_root.get()));
+        auto inherited = CertEnumCertificatesInStore(user_roots.value, nullptr);
+        CHECK(inherited && location(inherited) == CERT_SYSTEM_STORE_LOCAL_MACHINE);
+        CHECK(!CertCloseStore(user_roots.value, CERT_CLOSE_STORE_CHECK_FLAG));
+        CHECK(GetLastError() == CRYPT_E_PENDING_CLOSE);
+        user_roots.value = nullptr;
+        CHECK(property(inherited, CERT_SHA256_HASH_PROP_ID).size() == 32);
+        CHECK(CertFreeCertificateContext(inherited));
+    }
+    if (geteuid() == 0) {
+        CHECK(chmod(temp.path.c_str(), 0755) == 0);
+        pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            try {
+                CHECK(setgroups(0, nullptr) == 0 && setgid(65534) == 0 && setuid(65534) == 0);
+                CHECK(!scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_READONLY_FLAG));
+                CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+                configuration.userStoreDirectory = second_user.c_str();
+                CHECK(SysCertConfigureSystemStores(&configuration));
+                Store ca(scoped(L"CA", CERT_SYSTEM_STORE_CURRENT_USER, CERT_STORE_READONLY_FLAG));
+                CHECK(enumerate(ca.value) == 1);
+                Store computer(scoped(computer_import_name.c_str(), CERT_SYSTEM_STORE_LOCAL_MACHINE, CERT_STORE_READONLY_FLAG));
+                Certificate certificate(CertEnumCertificatesInStore(computer.value, nullptr));
+                CHECK(std::filesystem::exists(material_path(certificate.value)));
+                DWORD size = 0;
+                CHECK(!SysCertGetCertificateFilePath(certificate.value, TRUE, nullptr, &size));
+                CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+                CHECK(!CertDeleteCertificateFromStore(CertDuplicateCertificateContext(certificate.value)));
+                CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+                _exit(0);
+            } catch (const std::exception& error) {
+                std::cerr << error.what() << '\n';
+                _exit(1);
+            }
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    CHECK(SysCertConfigureSystemStores(nullptr));
+}
+
+void certutil_tests(const char* executable) {
+    TempDir temp;
+    auto user = (temp.path / "user").string();
+    auto machine = (temp.path / "machine").string();
+    auto system = (temp.path / "system").string();
+    auto log = (temp.path / "command.log").string();
+    auto ca_key = key();
+    auto ca = make_x509(ca_key.get(), 100, "Tool Root", true);
+    auto leaf_key = key();
+    auto leaf = make_x509(leaf_key.get(), 101, "Tool Leaf", false, ca.get(), ca_key.get());
+    auto leaf_der = der(leaf.get());
+    std::string leaf_binary(leaf_der.begin(), leaf_der.end());
+    auto other = make_x509(leaf_key.get(), 102, "Tool Leaf", false, ca.get(), ca_key.get());
+    auto native_bundle = std::filesystem::path(system) / "etc/ssl/certs/ca-certificates.crt";
+    write_file(std::filesystem::path(system) / "etc/os-release", "ID=ubuntu\n");
+    write_file(native_bundle, pem(ca.get()));
+    auto root_file = (temp.path / "root.pem").string();
+    auto leaf_file = (temp.path / "leaf.pem").string();
+    auto other_file = (temp.path / "other.der").string();
+    auto bundle_file = (temp.path / "bundle.pem").string();
+    auto pfx_file = (temp.path / "leaf.pfx").string();
+    auto password_file = (temp.path / "password").string();
+    auto output_file = (temp.path / "output.der").string();
+    write_file(root_file, pem(ca.get()));
+    write_file(leaf_file, pem(leaf.get()));
+    auto encoded = der(other.get());
+    write_file(other_file, std::string(encoded.begin(), encoded.end()));
+    write_file(bundle_file, pem(ca.get()) + pem(leaf.get()));
+    encoded = pfx_bytes(leaf.get(), leaf_key.get());
+    write_file(pfx_file, std::string(encoded.begin(), encoded.end()));
+    write_file(password_file, "password\n");
+    CHECK(chmod(password_file.c_str(), 0600) == 0);
+    auto run = [&](std::vector<std::string> arguments, int expected = 0) {
+        std::vector<std::string> command{executable, "--user-store-dir", user, "--machine-store-dir", machine,
+            "--system-root", system};
+        command.insert(command.end(), arguments.begin(), arguments.end());
+        std::vector<char*> argv;
+        for (auto& argument : command) argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            int output = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            int input = open("/dev/null", O_RDONLY);
+            if (output < 0 || input < 0 || dup2(output, STDOUT_FILENO) < 0 ||
+                dup2(output, STDERR_FILENO) < 0 || dup2(input, STDIN_FILENO) < 0) _exit(126);
+            close(output);
+            close(input);
+            execv(executable, argv.data());
+            _exit(127);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child);
+        auto output = read_file(log);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != expected) {
+            std::cerr << "certutil command:";
+            for (const auto& arg : arguments) std::cerr << ' ' << arg;
+            std::cerr << "\n" << output << '\n';
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == expected);
+        }
+        return output;
+    };
+    CHECK(run({"-?"}).find("not NSS certutil") != std::string::npos);
+    CHECK(run({"-enumstore"}).find("ROOT") != std::string::npos);
+    CHECK(!std::filesystem::exists(user) && !std::filesystem::exists(machine));
+    CHECK(run({"-store", "MY"}).find("0 certificate(s)") != std::string::npos);
+    CHECK(!std::filesystem::exists(machine));
+    CHECK(run({"-dump", leaf_file, "-v"}).find("Tool Leaf") != std::string::npos);
+    CHECK(run({other_file}).find("Serial Number: 66") != std::string::npos);
+    CHECK(run({"-dump", bundle_file}).find("Certificate 1") != std::string::npos);
+    run({"-unknown"}, 2);
+    run({"-store", "MY", "--format", "pem"}, 2);
+    run({"-store", "-p"}, 2);
+    run({"-user", "-machine", "-store"}, 2);
+    run({"-user", "--allow-native-write", "-addstore", "ROOT", root_file}, 2);
+    run({"-addstore", "ROOT", leaf_file}, 2);
+    CHECK(read_file(native_bundle) == pem(ca.get()));
+
+    run({"-user", "-addstore", "MY", leaf_file});
+    CHECK(run({"-store", "MY"}).find("0 certificate(s)") != std::string::npos);
+    auto shown = run({"-user", "-store", "MY"});
+    CHECK(shown.find("CurrentUser") != std::string::npos && shown.find("Tool Leaf") != std::string::npos);
+    const std::string hash_marker = "Cert Hash(sha256): ";
+    auto hash_start = shown.find(hash_marker);
+    CHECK(hash_start != std::string::npos);
+    auto hash = shown.substr(hash_start + hash_marker.size(), 64);
+    run({"-user", "-store", "MY", "sha256:" + hash, output_file});
+    CHECK(read_file(output_file) == leaf_binary);
+    run({"-user", "-store", "MY", "serial:65", output_file}, 1);
+    run({"-user", "-f", "-store", "MY", "serial:65", output_file});
+    run({"-user", "-exportPFX", "MY", "serial:65", (temp.path / "no-key.pfx").string(), "NoChain",
+        "--password-file", password_file}, 1);
+    CHECK(!std::filesystem::exists(temp.path / "no-key.pfx"));
+    run({"-user", "-addstore", "MY", leaf_file}, 1);
+    run({"-user", "-f", "-addstore", "MY", leaf_file});
+    run({"-user", "-addstore", "MY", other_file});
+    run({"-user", "-delstore", "MY", "subject:Tool Leaf"}, 1);
+    run({"-user", "-store", "MY", "*", output_file, "-f"}, 1);
+    run({"-user", "-delstore", "MY", "serial:66"});
+    run({"-user", "-store", "MY", "serial:66"}, 1);
+
+    auto malformed = (temp.path / "malformed.pem").string();
+    write_file(malformed, pem(ca.get()) + "-----BEGIN PRIVATE KEY-----\nnot a certificate\n");
+    run({"-user", "-addstore", "CA", malformed}, 1);
+    CHECK(run({"-user", "-store", "CA"}).find("0 certificate(s)") != std::string::npos);
+    auto trailing = (temp.path / "trailing.der").string();
+    write_file(trailing, read_file(other_file) + "trailing garbage");
+    run({"-dump", trailing}, 1);
+    run({"-addstore", "CA", root_file});
+    CHECK(run({"-user", "-store", "CA"}).find("inherited, read-only") != std::string::npos);
+    run({"-user", "-delstore", "CA", "index:0"}, 1);
+    run({"-user", "-addstore", "ROOT", leaf_file});
+    CHECK(run({"-user", "-store", "ROOT"}).find("2 certificate(s)") != std::string::npos);
+    CHECK(read_file(native_bundle) == pem(ca.get()));
+    run({"-user", "-delstore", "ROOT", "serial:65"});
+    run({"-user", "-delstore", "ROOT", "serial:64"}, 1);
+
+    run({"-user", "-addstore", "BUNDLE", bundle_file});
+    auto public_bundle = (temp.path / "export.p7b").string();
+    run({"-user", "-store", "BUNDLE", "*", public_bundle, "--format", "pkcs7"});
+    CHECK(run({"-dump", public_bundle}).find("Certificate 1") != std::string::npos);
+    run({"-user", "-addstore", "COPY", public_bundle});
+    CHECK(run({"-user", "-store", "COPY"}).find("2 certificate(s)") != std::string::npos);
+    auto public_pem = (temp.path / "export.pem").string();
+    run({"-user", "-store", "COPY", "*", public_pem, "--format", "pem"});
+    CHECK(read_file(public_pem) == read_file(bundle_file));
+    auto link = temp.path / "output-link";
+    std::filesystem::create_symlink(output_file, link);
+    run({"-user", "-f", "-store", "MY", "index:0", link.string()}, 1);
+    CHECK(read_file(output_file) == leaf_binary);
+
+    run({"-user", "-delstore", "MY", "serial:65"});
+    run({"-user", "-importPFX", pfx_file}, 1);
+    run({"-user", "-importPFX", pfx_file, "-p", "wrong"}, 1);
+    CHECK(run({"-user", "-store", "MY"}).find("0 certificate(s)") != std::string::npos);
+    run({"-user", "-importPFX", pfx_file, "--password-file", password_file});
+    CHECK(run({"-user", "-store", "MY"}).find("1 certificate(s)") != std::string::npos);
+    auto exported_pfx = (temp.path / "export.pfx").string();
+    run({"-user", "-exportPFX", "serial:65", exported_pfx, "--password-file", password_file});
+    struct stat status{};
+    CHECK(stat(exported_pfx.c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
+    auto pfx_data = read_file(exported_pfx);
+    const BYTE* cursor = reinterpret_cast<const BYTE*>(pfx_data.data());
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> pfx(d2i_PKCS12(nullptr, &cursor, static_cast<long>(pfx_data.size())), PKCS12_free);
+    CHECK(pfx && PKCS12_verify_mac(pfx.get(), "password", -1) == 1);
+    EVP_PKEY* raw_key = nullptr;
+    X509* raw_certificate = nullptr;
+    STACK_OF(X509)* raw_chain = nullptr;
+    CHECK(PKCS12_parse(pfx.get(), "password", &raw_key, &raw_certificate, &raw_chain) == 1);
+    Key imported_key(raw_key, EVP_PKEY_free);
+    X509Handle imported_certificate(raw_certificate, X509_free);
+    auto free_chain = [](STACK_OF(X509)* value) { sk_X509_pop_free(value, X509_free); };
+    std::unique_ptr<STACK_OF(X509), decltype(free_chain)> imported_chain(raw_chain, free_chain);
+    CHECK(imported_key && EVP_PKEY_eq(imported_key.get(), leaf_key.get()) == 1);
+    CHECK(imported_certificate && X509_cmp(imported_certificate.get(), leaf.get()) == 0);
+    CHECK(sk_X509_num(imported_chain.get()) == 1 && X509_cmp(sk_X509_value(imported_chain.get(), 0), ca.get()) == 0);
+    run({"-user", "-exportPFX", "serial:65", exported_pfx, "--password-file", password_file}, 1);
+    run({"-user", "-exportPFX", "serial:65", exported_pfx, "NoChain", "-f", "-p", "different"});
+    run({"-importPFX", "MY", exported_pfx, "-p", "different"});
+    CHECK(run({"-store", "MY"}).find("LocalMachine") != std::string::npos);
+    run({"-user", "-importPFX", "RESTORED", exported_pfx, "-p", "different"});
+    CHECK(run({"-user", "-store", "RESTORED"}).find("1 certificate(s)") != std::string::npos);
+    run({"-user", "-exportPFX", "serial:65", exported_pfx, "NoRoot", "-f", "-p", "different"});
+    run({"-user", "-importPFX", "NO_ROOT", exported_pfx, "-p", "different"});
+    CHECK(run({"-user", "-store", "NO_ROOT"}).find("1 certificate(s)") != std::string::npos);
+    run({"-user", "-exportPFX", "serial:65", exported_pfx, "NoChain", "-f", "-p", ""}, 2);
+    CHECK(chmod(password_file.c_str(), 0644) == 0);
+    run({"-user", "-importPFX", pfx_file, "--password-file", password_file}, 1);
+    CHECK(chmod(password_file.c_str(), 0600) == 0);
+    auto orphan_key = key();
+    auto orphan = make_x509(orphan_key.get(), 103, "Orphan", false, other.get(), leaf_key.get());
+    encoded = pfx_bytes(orphan.get(), orphan_key.get());
+    auto orphan_pfx = (temp.path / "orphan.pfx").string();
+    write_file(orphan_pfx, std::string(encoded.begin(), encoded.end()));
+    run({"-user", "-importPFX", "ORPHAN", orphan_pfx, "--password-file", password_file});
+    run({"-user", "-exportPFX", "ORPHAN", "index:0", exported_pfx, "-f", "--password-file", password_file}, 1);
+    run({"-user", "-exportPFX", "ORPHAN", "index:0", exported_pfx, "NoChain", "-f", "--password-file", password_file});
+
+    auto extra_root = make_x509(ca_key.get(), 104, "Extra Root", true);
+    auto extra_file = (temp.path / "extra.pem").string();
+    write_file(extra_file, pem(extra_root.get()));
+    auto anchors = std::filesystem::path(system) / "usr/local/share/ca-certificates";
+    std::filesystem::create_directories(anchors);
+    auto updater = std::filesystem::path(system) / "usr/sbin/update-ca-certificates";
+    write_file(updater, "#!/bin/sh\ncat '" + root_file + "' '" + anchors.string() + "'/*.crt > '" + native_bundle.string() + "'\n");
+    CHECK(chmod(updater.c_str(), 0700) == 0);
+    run({"--allow-native-write", "-addstore", "ROOT", extra_file});
+    CHECK(run({"-store", "ROOT"}).find("Extra Root") != std::string::npos);
+    write_file(updater, "#!/bin/sh\ncat '" + root_file + "' > '" + native_bundle.string() + "'\n");
+    run({"--allow-native-write", "-delstore", "ROOT", "serial:68"});
+    CHECK(read_file(native_bundle) == pem(ca.get()));
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path))
+        CHECK(!entry.path().filename().string().starts_with(".certutil-"));
+}
 }
 
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string(argv[1]) == "--child-read") return child_read(argv[2]);
+        if (argc == 3 && std::string(argv[1]) == "--certutil") {
+            certutil_tests(argv[2]);
+            std::cout << "All certutil tests passed\n";
+            return 0;
+        }
         memory_tests();
         disposition_tests();
         persistent_tests();
@@ -640,6 +1099,7 @@ int main(int argc, char** argv) {
         native_api_tests();
         error_tests();
         thread_tests();
+        system_scope_tests();
         std::cout << "All certificate-store tests passed\n";
         return 0;
     } catch (const std::exception& error) {
