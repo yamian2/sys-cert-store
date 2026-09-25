@@ -97,8 +97,12 @@ sudo dnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
 Azure Linux 3 dependencies:
 
 ```sh
-sudo tdnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
+sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
 ```
+
+Minimal Azure Linux container images may ship the distribution signing key
+without importing it into RPM's keyring. Import the shipped key before dependency
+installation; do not disable package or repository signature verification.
 
 Build and exercise the isolated fixtures:
 
