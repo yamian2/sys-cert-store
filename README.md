@@ -97,7 +97,7 @@ sudo dnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
 Azure Linux 3 dependencies:
 
 ```sh
-sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
+sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install gcc-c++ binutils glibc-devel cmake make openssl-devel sqlite-devel ca-certificates findutils
 ```
 
 Azure Linux package signatures use RPM's keyring, while the `tdnf` repository
