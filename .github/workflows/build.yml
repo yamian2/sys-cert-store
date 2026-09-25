@@ -29,7 +29,7 @@ jobs:
           - image: registry.access.redhat.com/ubi9/ubi:latest
             install: dnf install -y gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
           - image: mcr.microsoft.com/azurelinux/base/core:3.0
-            install: tdnf install -y gcc-c++ binutils glibc-devel cmake make openssl-devel sqlite-devel ca-certificates tar gzip findutils
+            install: tdnf install -y build-essential cmake openssl-devel sqlite-devel ca-certificates findutils
     container:
       image: ${{ matrix.image }}
     steps:
