@@ -97,12 +97,14 @@ sudo dnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
 Azure Linux 3 dependencies:
 
 ```sh
-sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
+sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
 ```
 
-Minimal Azure Linux container images may ship the distribution signing key
-without importing it into RPM's keyring. Import the shipped key before dependency
-installation; do not disable package or repository signature verification.
+Azure Linux package signatures use RPM's keyring, while the `tdnf` repository
+metadata plugin uses GPG's keyring under the current `HOME`. GitHub Actions
+overrides the container's `HOME`, so initialize both keyrings with the shipped
+distribution key before dependency installation. Do not disable package or
+repository signature verification.
 
 Build and exercise the isolated fixtures:
 

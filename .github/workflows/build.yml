@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Import the Azure Linux repository key shipped in the image
         if: matrix.image == 'mcr.microsoft.com/azurelinux/base/core:3.0'
-        run: rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+        run: rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
       - run: ${{ matrix.install }}
       - uses: actions/checkout@v4
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
