@@ -1,0 +1,1281 @@
+#include "internal.h"
+#include <openssl/asn1.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs7.h>
+#include <openssl/pkcs12.h>
+#include <openssl/rand.h>
+#include <openssl/x509v3.h>
+#include <sqlite3.h>
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <climits>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <fcntl.h>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <pwd.h>
+#include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <unordered_map>
+
+namespace scs {
+namespace {
+thread_local DWORD last_error = 0;
+thread_local std::array<char, 1024> last_message{};
+std::recursive_mutex api_mutex;
+
+void report(DWORD code, const char* message) noexcept {
+    last_error = code;
+    std::snprintf(last_message.data(), last_message.size(), "%s", message);
+}
+
+template<class R, class F> R boundary(R failure, F&& function) noexcept {
+    try {
+        std::lock_guard lock(api_mutex);
+        return function();
+    } catch (const Error& error) {
+        report(error.code, error.what());
+    } catch (const std::bad_alloc&) {
+        report(ERROR_NOT_ENOUGH_MEMORY, "Memory allocation failed");
+    } catch (const std::filesystem::filesystem_error& error) {
+        report(error.code() == std::errc::permission_denied ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE, error.what());
+    } catch (const std::exception& error) {
+        report(ERROR_GEN_FAILURE, error.what());
+    } catch (...) {
+        report(ERROR_GEN_FAILURE, "Unexpected exception at the C API boundary");
+    }
+    return failure;
+}
+
+DWORD count(std::size_t size) {
+    require(size <= std::numeric_limits<DWORD>::max(), ERROR_INVALID_DATA, "Value exceeds DWORD capacity");
+    return static_cast<DWORD>(size);
+}
+
+Bytes bytes(const BYTE* data, std::size_t size) {
+    require(data || size == 0, E_INVALIDARG, "Null buffer with nonzero size");
+    return size ? Bytes(data, data + size) : Bytes{};
+}
+
+void encoding_check(DWORD encoding) {
+    require((encoding & X509_ASN_ENCODING) != 0 &&
+        (encoding & ~(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING)) == 0,
+        ERROR_NOT_SUPPORTED, "Only X.509 certificate encoding is supported");
+}
+
+std::string utf8(LPCWSTR input) {
+    require(input != nullptr, E_INVALIDARG, "Null wide string");
+    std::string result;
+    for (; *input; ++input) {
+        auto cp = static_cast<std::uint32_t>(*input);
+        require(cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff), E_INVALIDARG, "Invalid Unicode scalar");
+        if (cp < 0x80) result += static_cast<char>(cp);
+        else if (cp < 0x800) {
+            result += static_cast<char>(0xc0 | (cp >> 6));
+            result += static_cast<char>(0x80 | (cp & 63));
+        } else if (cp < 0x10000) {
+            result += static_cast<char>(0xe0 | (cp >> 12));
+            result += static_cast<char>(0x80 | ((cp >> 6) & 63));
+            result += static_cast<char>(0x80 | (cp & 63));
+        } else {
+            result += static_cast<char>(0xf0 | (cp >> 18));
+            result += static_cast<char>(0x80 | ((cp >> 12) & 63));
+            result += static_cast<char>(0x80 | ((cp >> 6) & 63));
+            result += static_cast<char>(0x80 | (cp & 63));
+        }
+    }
+    return result;
+}
+
+void db_check(sqlite3* db, int result) {
+    if (result == SQLITE_OK || result == SQLITE_DONE || result == SQLITE_ROW) return;
+    DWORD code = ERROR_GEN_FAILURE;
+    switch (result & 0xff) {
+    case SQLITE_READONLY: case SQLITE_PERM: case SQLITE_AUTH: code = ERROR_ACCESS_DENIED; break;
+    case SQLITE_BUSY: case SQLITE_LOCKED: code = ERROR_BUSY; break;
+    case SQLITE_NOMEM: code = ERROR_NOT_ENOUGH_MEMORY; break;
+    case SQLITE_CORRUPT: case SQLITE_NOTADB: code = ERROR_INVALID_DATA; break;
+    }
+    throw Error(code, db ? sqlite3_errmsg(db) : "SQLite initialization failed");
+}
+
+struct Statement {
+    sqlite3* db;
+    sqlite3_stmt* value = nullptr;
+    Statement(sqlite3* database, const char* sql) : db(database) {
+        db_check(db, sqlite3_prepare_v2(db, sql, -1, &value, nullptr));
+    }
+    ~Statement() { sqlite3_finalize(value); }
+    Statement(const Statement&) = delete;
+    Statement& operator=(const Statement&) = delete;
+    void integer(int index, sqlite3_int64 number) { db_check(db, sqlite3_bind_int64(value, index, number)); }
+    void blob(int index, const Bytes& data) {
+        db_check(db, sqlite3_bind_blob64(value, index, data.empty() ? "" : static_cast<const void*>(data.data()),
+            data.size(), SQLITE_TRANSIENT));
+    }
+    void text(int index, const std::string& data) {
+        db_check(db, sqlite3_bind_text64(value, index, data.data(), data.size(), SQLITE_TRANSIENT, SQLITE_UTF8));
+    }
+    std::string text_column(int column) {
+        auto* data = sqlite3_column_text(value, column);
+        require(data, ERROR_INVALID_DATA, "Null object path in metadata");
+        return reinterpret_cast<const char*>(data);
+    }
+    bool step() {
+        int rc = sqlite3_step(value);
+        db_check(db, rc);
+        return rc == SQLITE_ROW;
+    }
+    Bytes blob_column(int column) {
+        auto size = sqlite3_column_bytes(value, column);
+        return bytes(static_cast<const BYTE*>(sqlite3_column_blob(value, column)), static_cast<std::size_t>(size));
+    }
+};
+
+struct Database {
+    sqlite3* value = nullptr;
+    Database(const std::string& path, bool readonly, bool initialize) {
+        sqlite3* raw = nullptr;
+        int rc = sqlite3_open_v2(path.c_str(), &raw,
+            (readonly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) |
+            SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> guard(raw, sqlite3_close);
+        db_check(raw, rc);
+        value = raw;
+        db_check(value, sqlite3_busy_timeout(value, 5000));
+        exec("PRAGMA foreign_keys=ON");
+        if (initialize) {
+            exec("BEGIN IMMEDIATE");
+            exec("CREATE TABLE IF NOT EXISTS certificates(id INTEGER PRIMARY KEY AUTOINCREMENT,object TEXT NOT NULL)");
+            exec("CREATE TABLE IF NOT EXISTS properties(cert INTEGER NOT NULL REFERENCES certificates(id) ON DELETE CASCADE,"
+                "property INTEGER NOT NULL,value BLOB NOT NULL,PRIMARY KEY(cert,property))");
+            exec("CREATE TABLE IF NOT EXISTS store_properties(property INTEGER PRIMARY KEY,value BLOB NOT NULL)");
+            exec("CREATE TABLE IF NOT EXISTS garbage(object TEXT PRIMARY KEY)");
+            exec("PRAGMA application_id=1396921137");
+            exec("PRAGMA user_version=2");
+            exec("COMMIT");
+        }
+        Statement app(value, "PRAGMA application_id");
+        require(app.step() && sqlite3_column_int(app.value, 0) == 1396921137,
+            ERROR_INVALID_DATA, "Not a sys-cert-store database");
+        Statement version(value, "PRAGMA user_version");
+        require(version.step() && sqlite3_column_int(version.value, 0) == 2,
+            ERROR_NOT_SUPPORTED, "Unsupported sys-cert-store schema version");
+        guard.release();
+    }
+    ~Database() { sqlite3_close(value); }
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+    void exec(const char* sql) { db_check(value, sqlite3_exec(value, sql, nullptr, nullptr, nullptr)); }
+};
+
+struct Transaction {
+    Database& db;
+    bool committed = false;
+    explicit Transaction(Database& database) : db(database) { db.exec("BEGIN IMMEDIATE"); }
+    ~Transaction() {
+        if (!committed && sqlite3_exec(db.value, "ROLLBACK", nullptr, nullptr, nullptr) != SQLITE_OK)
+            std::fputs("sys-cert-store: SQLite rollback failed\n", stderr);
+    }
+    void commit() { db.exec("COMMIT"); committed = true; }
+};
+
+using Properties = std::map<DWORD, Bytes>;
+using SharedKey = std::shared_ptr<EVP_PKEY>;
+struct Material {
+    Bytes der;
+    SharedKey key;
+};
+struct Store {
+    std::unique_ptr<Database> db;
+    bool readonly = false;
+    bool archived = false;
+    bool native = false;
+    NativeLayout layout{};
+    std::filesystem::path objects;
+    std::map<sqlite3_int64, Material> memory;
+    std::size_t references = 1;
+    std::size_t contexts = 0;
+};
+
+struct Context {
+    CERT_CONTEXT pub{};
+    CERT_INFO info{};
+    X509Ptr certificate{nullptr, X509_free};
+    Bytes der;
+    std::deque<Bytes> buffers;
+    std::deque<std::string> strings;
+    std::vector<CERT_EXTENSION> extensions;
+    Properties properties;
+    SharedKey private_key;
+    std::filesystem::path object_path;
+    std::shared_ptr<Store> store;
+    sqlite3_int64 row = 0;
+    std::size_t references = 1;
+
+    CRYPT_DATA_BLOB keep(Bytes data) {
+        buffers.push_back(std::move(data));
+        return {count(buffers.back().size()), buffers.back().data()};
+    }
+    char* oid(const ASN1_OBJECT* object) {
+        int length = OBJ_obj2txt(nullptr, 0, object, 1);
+        require(length > 0, ERROR_INVALID_DATA, "Invalid object identifier");
+        std::string result(static_cast<std::size_t>(length) + 1, '\0');
+        OBJ_obj2txt(result.data(), length + 1, object, 1);
+        result.resize(static_cast<std::size_t>(length));
+        strings.push_back(std::move(result));
+        return strings.back().data();
+    }
+    template<class T, class F> CRYPT_DATA_BLOB encode(T* object, F encoder) {
+        int length = encoder(object, nullptr);
+        require(length > 0, ERROR_INVALID_DATA, "ASN.1 encoding failed");
+        Bytes result(static_cast<std::size_t>(length));
+        auto* cursor = result.data();
+        require(encoder(object, &cursor) == length, ERROR_INVALID_DATA, "ASN.1 encoding failed");
+        return keep(std::move(result));
+    }
+    CRYPT_ALGORITHM_IDENTIFIER algorithm(const X509_ALGOR* alg) {
+        const ASN1_OBJECT* object = nullptr;
+        int type = V_ASN1_UNDEF;
+        const void* parameter = nullptr;
+        X509_ALGOR_get0(&object, &type, &parameter, alg);
+        CRYPT_ALGORITHM_IDENTIFIER result{oid(object), {}};
+        if (type != V_ASN1_UNDEF) {
+            std::unique_ptr<ASN1_TYPE, decltype(&ASN1_TYPE_free)> value(ASN1_TYPE_new(), ASN1_TYPE_free);
+            require(value != nullptr, ERROR_NOT_ENOUGH_MEMORY, "ASN.1 allocation failed");
+            require(ASN1_TYPE_set1(value.get(), type, parameter) == 1, ERROR_INVALID_DATA, "Invalid algorithm parameters");
+            result.Parameters = encode(value.get(), i2d_ASN1_TYPE);
+        }
+        return result;
+    }
+    CRYPT_BIT_BLOB bit_blob(const ASN1_BIT_STRING* bits) {
+        if (!bits) return {};
+        auto blob = keep(bytes(ASN1_STRING_get0_data(bits), static_cast<std::size_t>(ASN1_STRING_length(bits))));
+        return {blob.cbData, blob.pbData, static_cast<DWORD>((bits->flags & ASN1_STRING_FLAG_BITS_LEFT) ? bits->flags & 7 : 0)};
+    }
+    static FILETIME time(const ASN1_TIME* input) {
+        std::tm value{};
+        require(ASN1_TIME_to_tm(input, &value) == 1, ERROR_INVALID_DATA, "Invalid certificate validity time");
+        auto seconds = static_cast<std::int64_t>(timegm(&value)) + 11644473600LL;
+        require(seconds >= 0, ERROR_NOT_SUPPORTED, "Certificate time predates FILETIME epoch");
+        auto ticks = static_cast<std::uint64_t>(seconds) * 10000000;
+        return {static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
+    }
+    explicit Context(Bytes input) : der(std::move(input)) {
+        require(!der.empty() && der.size() <= static_cast<std::size_t>(LONG_MAX),
+            ERROR_INVALID_DATA, "Empty or oversized certificate");
+        const auto* cursor = der.data();
+        certificate.reset(d2i_X509(nullptr, &cursor, static_cast<long>(der.size())));
+        require(certificate && cursor == der.data() + der.size(), ERROR_INVALID_DATA, "Invalid DER certificate or trailing bytes");
+        auto* x = certificate.get();
+        info.dwVersion = static_cast<DWORD>(X509_get_version(x));
+        const auto* serial = X509_get0_serialNumber(x);
+        require(ASN1_STRING_type(serial) != V_ASN1_NEG_INTEGER, ERROR_NOT_SUPPORTED, "Negative certificate serial numbers are unsupported");
+        auto serial_bytes = bytes(ASN1_STRING_get0_data(serial), static_cast<std::size_t>(ASN1_STRING_length(serial)));
+        std::reverse(serial_bytes.begin(), serial_bytes.end());
+        info.SerialNumber = keep(std::move(serial_bytes));
+        info.SignatureAlgorithm = algorithm(X509_get0_tbs_sigalg(x));
+        info.Issuer = encode(X509_get_issuer_name(x), i2d_X509_NAME);
+        info.Subject = encode(X509_get_subject_name(x), i2d_X509_NAME);
+        info.NotBefore = time(X509_get0_notBefore(x));
+        info.NotAfter = time(X509_get0_notAfter(x));
+        X509_ALGOR* pub_alg = nullptr;
+        const BYTE* public_key = nullptr;
+        int public_size = 0;
+        require(X509_PUBKEY_get0_param(nullptr, &public_key, &public_size, &pub_alg, X509_get_X509_PUBKEY(x)) == 1,
+            ERROR_INVALID_DATA, "Invalid certificate public key");
+        info.SubjectPublicKeyInfo.Algorithm = algorithm(pub_alg);
+        info.SubjectPublicKeyInfo.PublicKey = bit_blob(X509_get0_pubkey_bitstr(x));
+        const ASN1_BIT_STRING* issuer_id = nullptr;
+        const ASN1_BIT_STRING* subject_id = nullptr;
+        X509_get0_uids(x, &issuer_id, &subject_id);
+        info.IssuerUniqueId = bit_blob(issuer_id);
+        info.SubjectUniqueId = bit_blob(subject_id);
+        for (int i = 0; i < X509_get_ext_count(x); ++i) {
+            auto* extension = X509_get_ext(x, i);
+            auto* data = X509_EXTENSION_get_data(extension);
+            extensions.push_back({oid(X509_EXTENSION_get_object(extension)), X509_EXTENSION_get_critical(extension),
+                keep(bytes(ASN1_STRING_get0_data(data), static_cast<std::size_t>(ASN1_STRING_length(data))))});
+        }
+        info.cExtension = count(extensions.size());
+        info.rgExtension = extensions.data();
+        pub = {X509_ASN_ENCODING, der.data(), count(der.size()), &info, nullptr};
+    }
+    ~Context() { if (store) --store->contexts; }
+};
+
+std::unordered_map<HCERTSTORE, std::shared_ptr<Store>> stores;
+std::unordered_map<PCCERT_CONTEXT, std::unique_ptr<Context>> contexts;
+
+std::shared_ptr<Store> get_store(HCERTSTORE handle) {
+    auto found = stores.find(handle);
+    require(found != stores.end(), ERROR_INVALID_HANDLE, "Invalid or closed certificate store handle");
+    return found->second;
+}
+Context& get_context(PCCERT_CONTEXT context) {
+    auto found = contexts.find(context);
+    require(found != contexts.end(), ERROR_INVALID_HANDLE, "Invalid or freed certificate context");
+    return *found->second;
+}
+void release(PCCERT_CONTEXT context) {
+    if (context && --get_context(context).references == 0) contexts.erase(context);
+}
+struct Consume {
+    PCCERT_CONTEXT context;
+    explicit Consume(PCCERT_CONTEXT input) : context(input) { if (context) get_context(context); }
+    ~Consume() { if (context) release(context); }
+};
+
+PCCERT_CONTEXT publish(std::unique_ptr<Context> context, std::shared_ptr<Store> store = {}, sqlite3_int64 row = 0) {
+    auto* result = &context->pub;
+    context->store = std::move(store);
+    if (context->store) ++context->store->contexts;
+    context->pub.hCertStore = context->store.get();
+    context->row = row;
+    contexts.emplace(result, std::move(context));
+    return result;
+}
+
+std::string object_id() {
+    std::array<BYTE, 16> random{};
+    require(RAND_bytes(random.data(), static_cast<int>(random.size())) == 1, ERROR_GEN_FAILURE, "Cannot generate object identifier");
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    for (BYTE ch : random) { result += digits[ch >> 4]; result += digits[ch & 15]; }
+    return result;
+}
+std::filesystem::path object_directory(const Store& store, const std::string& id) {
+    require(id.size() == 32 && id.find_first_not_of("0123456789abcdef") == std::string::npos,
+        ERROR_INVALID_DATA, "Invalid object reference in metadata");
+    return store.objects / id;
+}
+void private_directory(const std::filesystem::path& path) {
+    if (mkdir(path.c_str(), 0700) != 0)
+        require(errno == EEXIST, ERROR_ACCESS_DENIED, "Cannot create private object directory");
+    struct stat status{};
+    require(lstat(path.c_str(), &status) == 0 && S_ISDIR(status.st_mode) &&
+        status.st_uid == geteuid() && (status.st_mode & 077) == 0,
+        ERROR_ACCESS_DENIED, "Object directory must be private, non-symlink and owned by the current user");
+}
+void flush_directory(const std::filesystem::path& path) {
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    require(fd >= 0, ERROR_GEN_FAILURE, "Cannot open object directory for flush");
+    int result = fsync(fd);
+    close(fd);
+    require(result == 0, ERROR_GEN_FAILURE, "Cannot flush object directory");
+}
+void erase_object(const std::filesystem::path& path) {
+    struct stat status{};
+    if (lstat(path.c_str(), &status) != 0) {
+        require(errno == ENOENT, ERROR_GEN_FAILURE, "Cannot inspect retired certificate object");
+        return;
+    }
+    require(S_ISDIR(status.st_mode) && status.st_uid == geteuid(), ERROR_ACCESS_DENIED, "Unsafe retired object directory");
+    std::filesystem::remove(path / "certificate.pem");
+    std::filesystem::remove(path / "private-key.pem");
+    require(std::filesystem::remove(path), ERROR_GEN_FAILURE, "Cannot remove retired object directory");
+    flush_directory(path.parent_path());
+}
+void collect_garbage(Store& store) {
+    if (store.objects.empty() || store.readonly) return;
+    Statement query(store.db->value, "SELECT object FROM garbage");
+    std::vector<std::string> pending;
+    while (query.step()) pending.push_back(query.text_column(0));
+    for (const auto& id : pending) {
+        erase_object(object_directory(store, id));
+        Statement remove(store.db->value, "DELETE FROM garbage WHERE object=?");
+        remove.text(1, id);
+        remove.step();
+    }
+}
+void retire_row(Store& store, sqlite3_int64 row) {
+    if (!store.objects.empty()) {
+        Statement retire(store.db->value, "INSERT OR IGNORE INTO garbage SELECT object FROM certificates WHERE id=?");
+        retire.integer(1, row);
+        retire.step();
+    }
+    Statement remove(store.db->value, "DELETE FROM certificates WHERE id=?");
+    remove.integer(1, row);
+    remove.step();
+}
+
+struct CloseFile { void operator()(FILE* file) const { std::fclose(file); } };
+using FileHandle = std::unique_ptr<FILE, CloseFile>;
+FileHandle open_material_file(const std::filesystem::path& path, bool write) {
+    int fd = open(path.c_str(), (write ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW, 0600);
+    require(fd >= 0, errno == EACCES ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE, "Cannot open certificate/key object file");
+    struct stat status{};
+    bool safe = fstat(fd, &status) == 0 && S_ISREG(status.st_mode) && status.st_nlink == 1 &&
+        status.st_uid == geteuid() && (status.st_mode & 077) == 0;
+    if (!safe) { close(fd); throw Error(ERROR_ACCESS_DENIED, "Object file must be private, regular and owned by the current user"); }
+    FILE* file = fdopen(fd, write ? "wb" : "rb");
+    if (!file) { close(fd); throw Error(ERROR_GEN_FAILURE, "Cannot open object file stream"); }
+    return FileHandle(file);
+}
+void flush_file(FILE* file) {
+    require(std::fflush(file) == 0 && fsync(fileno(file)) == 0, ERROR_GEN_FAILURE, "Cannot persist certificate/key object");
+}
+struct NewObject {
+    std::filesystem::path path;
+    Store* memory_store = nullptr;
+    sqlite3_int64 memory_row = 0;
+    bool committed = false;
+    ~NewObject() {
+        if (!committed && memory_store) memory_store->memory.erase(memory_row);
+        if (!committed && !path.empty()) {
+            try { erase_object(path); }
+            catch (const std::exception& error) { std::fprintf(stderr, "sys-cert-store: object cleanup failed: %s\n", error.what()); }
+        }
+    }
+};
+std::string create_object(Store& store, Context& source, NewObject& pending) {
+    auto id = object_id();
+    auto directory = object_directory(store, id);
+    require(mkdir(directory.c_str(), 0700) == 0, ERROR_GEN_FAILURE, "Cannot create certificate object directory");
+    pending.path = directory;
+    {
+        auto file = open_material_file(pending.path / "certificate.pem", true);
+        require(PEM_write_X509(file.get(), source.certificate.get()) == 1, ERROR_GEN_FAILURE, "Cannot encode certificate file");
+        flush_file(file.get());
+    }
+    if (source.private_key) {
+        require(X509_check_private_key(source.certificate.get(), source.private_key.get()) == 1,
+            ERROR_INVALID_DATA, "Private key does not match certificate");
+        auto file = open_material_file(pending.path / "private-key.pem", true);
+        require(PEM_write_PKCS8PrivateKey(file.get(), source.private_key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1,
+            ERROR_GEN_FAILURE, "Cannot encode PKCS#8 key file");
+        flush_file(file.get());
+    }
+    flush_directory(pending.path);
+    flush_directory(store.objects);
+    return id;
+}
+std::unique_ptr<Context> load_context(Store& store, sqlite3_int64 row) {
+    if (store.objects.empty()) {
+        auto found = store.memory.find(row);
+        require(found != store.memory.end(), ERROR_INVALID_DATA, "Missing memory-store certificate");
+        auto result = std::make_unique<Context>(found->second.der);
+        result->private_key = found->second.key;
+        return result;
+    }
+    Statement query(store.db->value, "SELECT object FROM certificates WHERE id=?");
+    query.integer(1, row);
+    require(query.step(), CRYPT_E_NOT_FOUND, "Certificate object was removed");
+    auto directory = object_directory(store, query.text_column(0));
+    struct stat status{};
+    require(lstat(directory.c_str(), &status) == 0 && S_ISDIR(status.st_mode) &&
+        status.st_uid == geteuid() && (status.st_mode & 077) == 0, ERROR_ACCESS_DENIED, "Unsafe certificate object directory");
+    auto file = open_material_file(directory / "certificate.pem", false);
+    X509Ptr certificate(PEM_read_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
+    require(certificate != nullptr, ERROR_INVALID_DATA, "Invalid certificate PEM object");
+    auto result = std::make_unique<Context>(encode_x509(certificate.get()));
+    result->object_path = directory;
+    auto key_path = directory / "private-key.pem";
+    if (lstat(key_path.c_str(), &status) == 0) {
+        auto key_file = open_material_file(key_path, false);
+        result->private_key.reset(PEM_read_PrivateKey(key_file.get(), nullptr,
+            [](char*, int, int, void*) { return 0; }, nullptr), EVP_PKEY_free);
+        require(result->private_key && X509_check_private_key(result->certificate.get(), result->private_key.get()) == 1,
+            ERROR_INVALID_DATA, "Invalid or mismatched PKCS#8 private-key object");
+    } else require(errno == ENOENT, ERROR_GEN_FAILURE, "Cannot inspect private-key object");
+    return result;
+}
+
+bool row_exists(Context& context) {
+    if (!context.store || context.store->references == 0) return false;
+    Statement query(context.store->db->value, "SELECT 1 FROM certificates WHERE id=?");
+    query.integer(1, context.row);
+    return query.step();
+}
+void refresh_properties(Context& context) {
+    if (!row_exists(context)) return;
+    Properties result;
+    Statement query(context.store->db->value, "SELECT property,value FROM properties WHERE cert=? ORDER BY property");
+    query.integer(1, context.row);
+    while (query.step())
+        result.emplace(static_cast<DWORD>(sqlite3_column_int64(query.value, 0)), query.blob_column(1));
+    context.properties = std::move(result);
+}
+void snapshot_row(const std::shared_ptr<Store>& store, sqlite3_int64 row) {
+    for (auto& [key, context] : contexts) {
+        (void)key;
+        if (context->store == store && context->row == row) refresh_properties(*context);
+    }
+}
+void write_properties(Store& store, sqlite3_int64 row, const Properties& properties) {
+    for (const auto& [id, data] : properties) {
+        Statement insert(store.db->value, "INSERT OR REPLACE INTO properties(cert,property,value) VALUES(?,?,?)");
+        insert.integer(1, row);
+        insert.integer(2, id);
+        insert.blob(3, data);
+        insert.step();
+    }
+}
+void writable(const Store& store) {
+    require(!store.readonly, ERROR_ACCESS_DENIED, "Store is read-only; native stores require explicit SYS_CERT_STORE_NATIVE_WRITE_FLAG");
+}
+sqlite3_int64 insert_material(Store& store, Context& source, NewObject& pending) {
+    auto object = store.objects.empty() ? std::string{} : create_object(store, source, pending);
+    Statement insert(store.db->value, "INSERT INTO certificates(object) VALUES(?)");
+    insert.text(1, object);
+    insert.step();
+    auto row = sqlite3_last_insert_rowid(store.db->value);
+    if (store.objects.empty()) {
+        pending.memory_store = &store;
+        pending.memory_row = row;
+        store.memory.emplace(row, Material{source.der, source.private_key});
+    }
+    return row;
+}
+void load_native(Store& store) {
+    auto certificates = read_native(store.layout);
+    auto replacement = std::make_unique<Database>(":memory:", false, true);
+    std::map<sqlite3_int64, Material> material;
+    Transaction transaction(*replacement);
+    for (auto& der : certificates) {
+        Context validate(der);
+        Statement insert(replacement->value, "INSERT INTO certificates(object) VALUES('')");
+        insert.step();
+        material.emplace(sqlite3_last_insert_rowid(replacement->value), Material{std::move(der), {}});
+    }
+    transaction.commit();
+    store.db = std::move(replacement);
+    store.memory = std::move(material);
+}
+HCERTSTORE publish_store(std::shared_ptr<Store> store) {
+    auto* result = store.get();
+    stores.emplace(result, std::move(store));
+    return result;
+}
+
+bool equal_blob(const CRYPT_DATA_BLOB& left, const CRYPT_DATA_BLOB& right) {
+    require((left.pbData || left.cbData == 0) && (right.pbData || right.cbData == 0), E_INVALIDARG, "Invalid blob");
+    return left.cbData == right.cbData &&
+        (left.cbData == 0 || std::memcmp(left.pbData, right.pbData, left.cbData) == 0);
+}
+bool same_identity(Context& left, Context& right) {
+    return X509_NAME_cmp(X509_get_issuer_name(left.certificate.get()), X509_get_issuer_name(right.certificate.get())) == 0 &&
+        ASN1_INTEGER_cmp(X509_get0_serialNumber(left.certificate.get()), X509_get0_serialNumber(right.certificate.get())) == 0;
+}
+bool name_matches(X509_NAME* name, const CRYPT_DATA_BLOB& blob) {
+    require(blob.pbData && blob.cbData, E_INVALIDARG, "Empty encoded name");
+    const auto* cursor = blob.pbData;
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> parsed(
+        d2i_X509_NAME(nullptr, &cursor, blob.cbData), X509_NAME_free);
+    require(parsed && cursor == blob.pbData + blob.cbData, ERROR_INVALID_DATA, "Invalid encoded distinguished name");
+    return X509_NAME_cmp(name, parsed.get()) == 0;
+}
+std::string lower_ascii(std::string input) {
+    for (auto& ch : input) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + ('a' - 'A'));
+    return input;
+}
+std::string simple_name(X509_NAME* name) {
+    std::string result;
+    for (int i = 0; i < X509_NAME_entry_count(name); ++i) {
+        auto* entry = X509_NAME_get_entry(name, i);
+        BYTE* output = nullptr;
+        int size = ASN1_STRING_to_UTF8(&output, X509_NAME_ENTRY_get_data(entry));
+        require(size >= 0, ERROR_INVALID_DATA, "Unable to decode certificate name");
+        std::unique_ptr<BYTE, decltype([](BYTE* p) { OPENSSL_free(p); })> guard(output);
+        if (!result.empty()) result += ", ";
+        result.append(reinterpret_cast<const char*>(output), static_cast<std::size_t>(size));
+    }
+    return result;
+}
+bool supported_property(DWORD property) {
+    return property == CERT_FRIENDLY_NAME_PROP_ID || property == CERT_DESCRIPTION_PROP_ID ||
+        property == CERT_ARCHIVED_PROP_ID || property == CERT_KEY_IDENTIFIER_PROP_ID ||
+        property == CERT_SHA1_HASH_PROP_ID || property == CERT_SHA256_HASH_PROP_ID || property == CERT_MD5_HASH_PROP_ID ||
+        (property >= CERT_FIRST_USER_PROP_ID && property <= CERT_LAST_USER_PROP_ID);
+}
+Bytes property_value(Context& context, DWORD property) {
+    require(supported_property(property), ERROR_NOT_SUPPORTED, "Certificate property is not supported");
+    refresh_properties(context);
+    auto found = context.properties.find(property);
+    if (found != context.properties.end()) return found->second;
+    const EVP_MD* algorithm = nullptr;
+    if (property == CERT_SHA1_HASH_PROP_ID) algorithm = EVP_sha1();
+    if (property == CERT_SHA256_HASH_PROP_ID) algorithm = EVP_sha256();
+    if (property == CERT_MD5_HASH_PROP_ID) algorithm = EVP_md5();
+    if (algorithm) {
+        Bytes digest(static_cast<std::size_t>(EVP_MD_get_size(algorithm)));
+        unsigned int size = 0;
+        require(X509_digest(context.certificate.get(), algorithm, digest.data(), &size) == 1,
+            ERROR_GEN_FAILURE, "Certificate digest computation failed");
+        digest.resize(size);
+        return digest;
+    }
+    if (property == CERT_KEY_IDENTIFIER_PROP_ID) {
+        const auto* identifier = X509_get0_subject_key_id(context.certificate.get());
+        if (identifier) return bytes(ASN1_STRING_get0_data(identifier), static_cast<std::size_t>(ASN1_STRING_length(identifier)));
+        Bytes digest(20);
+        unsigned int size = 0;
+        require(X509_pubkey_digest(context.certificate.get(), EVP_sha1(), digest.data(), &size) == 1,
+            ERROR_GEN_FAILURE, "Public-key identifier computation failed");
+        digest.resize(size);
+        return digest;
+    }
+    throw Error(CRYPT_E_NOT_FOUND, "Certificate property is not set");
+}
+
+void copy_out(const Bytes& value, void* data, DWORD* size) {
+    require(size, E_INVALIDARG, "Null output size");
+    DWORD capacity = *size;
+    *size = count(value.size());
+    if (!data) return;
+    require(capacity >= value.size(), ERROR_MORE_DATA, "Output buffer is too small");
+    if (!value.empty()) std::memcpy(data, value.data(), value.size());
+}
+
+bool matches(Context& candidate, DWORD type, const void* parameter) {
+    auto* x = candidate.certificate.get();
+    if (type == CERT_FIND_ANY) return true;
+    require(parameter, E_INVALIDARG, "Null search parameter");
+    switch (type) {
+    case CERT_FIND_EXISTING: return same_identity(candidate, get_context(static_cast<PCCERT_CONTEXT>(parameter)));
+    case CERT_FIND_SUBJECT_CERT: {
+        const auto& id = *static_cast<const CERT_INFO*>(parameter);
+        return equal_blob(candidate.info.SerialNumber, id.SerialNumber) && name_matches(X509_get_issuer_name(x), id.Issuer);
+    }
+    case CERT_FIND_ISSUER_OF:
+        return X509_NAME_cmp(X509_get_subject_name(x),
+            X509_get_issuer_name(get_context(static_cast<PCCERT_CONTEXT>(parameter)).certificate.get())) == 0;
+    case CERT_FIND_SUBJECT_NAME: case CERT_FIND_ISSUER_NAME:
+        return name_matches(type == CERT_FIND_SUBJECT_NAME ? X509_get_subject_name(x) : X509_get_issuer_name(x),
+            *static_cast<const CRYPT_DATA_BLOB*>(parameter));
+    case CERT_FIND_SUBJECT_STR_A: case CERT_FIND_SUBJECT_STR_W:
+    case CERT_FIND_ISSUER_STR_A: case CERT_FIND_ISSUER_STR_W: {
+        bool wide = type == CERT_FIND_SUBJECT_STR_W || type == CERT_FIND_ISSUER_STR_W;
+        bool subject = type == CERT_FIND_SUBJECT_STR_A || type == CERT_FIND_SUBJECT_STR_W;
+        auto needle = wide ? utf8(static_cast<LPCWSTR>(parameter)) : std::string(static_cast<LPCSTR>(parameter));
+        auto haystack = simple_name(subject ? X509_get_subject_name(x) : X509_get_issuer_name(x));
+        return lower_ascii(haystack).find(lower_ascii(needle)) != std::string::npos;
+    }
+    case CERT_FIND_SHA1_HASH: case CERT_FIND_SHA256_HASH: case CERT_FIND_MD5_HASH: case CERT_FIND_KEY_IDENTIFIER: {
+        DWORD id = type == CERT_FIND_SHA1_HASH ? CERT_SHA1_HASH_PROP_ID :
+            type == CERT_FIND_SHA256_HASH ? CERT_SHA256_HASH_PROP_ID :
+            type == CERT_FIND_MD5_HASH ? CERT_MD5_HASH_PROP_ID : CERT_KEY_IDENTIFIER_PROP_ID;
+        auto value = property_value(candidate, id);
+        CRYPT_DATA_BLOB blob{count(value.size()), value.data()};
+        return equal_blob(blob, *static_cast<const CRYPT_DATA_BLOB*>(parameter));
+    }
+    case CERT_FIND_PROPERTY: {
+        DWORD id = *static_cast<const DWORD*>(parameter);
+        require(supported_property(id), ERROR_NOT_SUPPORTED, "Search property is not supported");
+        refresh_properties(candidate);
+        return candidate.properties.contains(id);
+    }
+    default: throw Error(ERROR_NOT_SUPPORTED, "Certificate search type is not supported");
+    }
+}
+
+void check_find_type(DWORD type) {
+    switch (type) {
+    case CERT_FIND_ANY: case CERT_FIND_EXISTING: case CERT_FIND_SUBJECT_CERT: case CERT_FIND_ISSUER_OF:
+    case CERT_FIND_SUBJECT_NAME: case CERT_FIND_ISSUER_NAME: case CERT_FIND_SUBJECT_STR_A: case CERT_FIND_SUBJECT_STR_W:
+    case CERT_FIND_ISSUER_STR_A: case CERT_FIND_ISSUER_STR_W: case CERT_FIND_SHA1_HASH: case CERT_FIND_SHA256_HASH:
+    case CERT_FIND_MD5_HASH: case CERT_FIND_KEY_IDENTIFIER: case CERT_FIND_PROPERTY: return;
+    default: throw Error(ERROR_NOT_SUPPORTED, "Certificate search type is not supported");
+    }
+}
+PCCERT_CONTEXT find(HCERTSTORE handle, DWORD type, const void* parameter, PCCERT_CONTEXT previous) {
+    auto store = get_store(handle);
+    sqlite3_int64 after = 0;
+    if (previous) {
+        auto& old = get_context(previous);
+        require(old.store == store, E_INVALIDARG, "Previous context belongs to a different store");
+        after = old.row;
+    }
+    check_find_type(type);
+    require(type == CERT_FIND_ANY || parameter, E_INVALIDARG, "Null search parameter");
+    Statement query(store->db->value, "SELECT id FROM certificates WHERE id>? ORDER BY id");
+    query.integer(1, after);
+    while (query.step()) {
+        auto row = sqlite3_column_int64(query.value, 0);
+        auto candidate = load_context(*store, row);
+        candidate->store = store;
+        ++store->contexts;
+        candidate->row = row;
+        refresh_properties(*candidate);
+        if (type == CERT_FIND_ANY && !store->archived && candidate->properties.contains(CERT_ARCHIVED_PROP_ID)) continue;
+        if (!matches(*candidate, type, parameter)) continue;
+        --store->contexts;
+        candidate->store.reset();
+        return publish(std::move(candidate), store, row);
+    }
+    throw Error(CRYPT_E_NOT_FOUND, "No matching certificate");
+}
+
+std::string store_name(std::string name) {
+    require(!name.empty() && name.size() <= 64, E_INVALIDARG, "Store name must contain 1 to 64 ASCII letters, digits, '-' or '_'");
+    for (auto& ch : name) {
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - ('a' - 'A'));
+        require((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_',
+            E_INVALIDARG, "Invalid logical store name");
+    }
+    return name;
+}
+std::filesystem::path user_data_directory() {
+    std::array<char, 16384> buffer{};
+    passwd entry{};
+    passwd* result = nullptr;
+    require(getpwuid_r(geteuid(), &entry, buffer.data(), buffer.size(), &result) == 0 && result,
+        ERROR_GEN_FAILURE, "Cannot resolve the current user's home directory");
+    return std::filesystem::path(entry.pw_dir) / ".local/share/sys-cert-store";
+}
+
+std::unique_ptr<Database> open_database(const std::filesystem::path& path, DWORD flags) {
+    require(path.is_absolute(), E_INVALIDARG, "SQLite store path must be absolute");
+    bool readonly = (flags & CERT_STORE_READONLY_FLAG) != 0;
+    bool existing_only = (flags & CERT_STORE_OPEN_EXISTING_FLAG) != 0 || readonly;
+    bool create_only = (flags & CERT_STORE_CREATE_NEW_FLAG) != 0;
+    require(!(existing_only && create_only), E_INVALIDARG, "Conflicting store open flags");
+    bool created = false;
+    if (!existing_only) {
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd >= 0) { close(fd); created = true; }
+        else if (errno != EEXIST) throw Error(errno == EACCES ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE,
+            "Cannot create SQLite store: " + std::string(std::strerror(errno)));
+        else require(!create_only, CRYPT_E_EXISTS, "Store already exists");
+    }
+    struct stat status{};
+    require(lstat(path.c_str(), &status) == 0, ERROR_FILE_NOT_FOUND, "SQLite store does not exist");
+    require(S_ISREG(status.st_mode), ERROR_ACCESS_DENIED, "SQLite store must be a regular non-symlink file");
+    return std::make_unique<Database>(path.string(), readonly, created);
+}
+
+void persistent_store(Store& store, const std::filesystem::path& path, DWORD flags) {
+    store.db = open_database(path, flags);
+    store.objects = path.string() + ".objects";
+    if (!store.readonly) private_directory(store.objects);
+    collect_garbage(store);
+}
+
+HCERTSTORE open_store(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY legacy, DWORD flags, const void* parameter) {
+    require(legacy == 0, ERROR_NOT_SUPPORTED, "Legacy cryptographic providers are unsupported");
+    require(encoding == 0 || encoding == X509_ASN_ENCODING || encoding == (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING),
+        ERROR_NOT_SUPPORTED, "Unsupported store encoding");
+    constexpr DWORD allowed = CERT_STORE_READONLY_FLAG | CERT_STORE_OPEN_EXISTING_FLAG |
+        CERT_STORE_CREATE_NEW_FLAG | CERT_STORE_ENUM_ARCHIVED_FLAG | 0xff0000 | SYS_CERT_STORE_NATIVE_WRITE_FLAG;
+    require((flags & ~allowed) == 0, ERROR_NOT_SUPPORTED, "Unsupported store open flags");
+    require(!((flags & CERT_STORE_CREATE_NEW_FLAG) && (flags & CERT_STORE_OPEN_EXISTING_FLAG)),
+        E_INVALIDARG, "Conflicting store open flags");
+    auto result = std::make_shared<Store>();
+    result->readonly = (flags & CERT_STORE_READONLY_FLAG) != 0;
+    bool native_write = (flags & SYS_CERT_STORE_NATIVE_WRITE_FLAG) != 0;
+    require(!(native_write && result->readonly), E_INVALIDARG, "Conflicting native-write and read-only flags");
+    result->archived = (flags & CERT_STORE_ENUM_ARCHIVED_FLAG) != 0;
+    auto id = reinterpret_cast<std::uintptr_t>(provider);
+    if (id > 0xffff && std::strcmp(provider, "Memory") == 0) id = 2;
+    if (id > 0xffff && std::strcmp(provider, "System") == 0) id = 10;
+    if (id == 2) {
+        require(!parameter && !(flags & 0xff0000) && !native_write, E_INVALIDARG, "Invalid memory store parameters");
+        require(!(flags & CERT_STORE_OPEN_EXISTING_FLAG), ERROR_NOT_SUPPORTED, "Memory stores cannot open existing storage");
+        result->db = std::make_unique<Database>(":memory:", false, true);
+    } else if (id == 9 || id == 10) {
+        require(parameter, E_INVALIDARG, "Missing system store name");
+        auto name = store_name(id == 10 ? utf8(static_cast<LPCWSTR>(parameter)) : static_cast<LPCSTR>(parameter));
+        DWORD location = flags & 0xff0000;
+        require(location == CERT_SYSTEM_STORE_CURRENT_USER || location == CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            ERROR_NOT_SUPPORTED, "Only current-user and local-machine locations are supported");
+        if (name == "ROOT") {
+            require(!(flags & CERT_STORE_CREATE_NEW_FLAG), CRYPT_E_EXISTS, "Native ROOT store already exists");
+            result->native = true;
+            result->readonly = !native_write;
+            result->layout = native_layout(nullptr);
+            load_native(*result);
+        } else {
+            require(!native_write, E_INVALIDARG, "Native-write flag is only valid for ROOT/native stores");
+            auto directory = location == CERT_SYSTEM_STORE_CURRENT_USER ? user_data_directory() :
+                std::filesystem::path("/var/lib/sys-cert-store");
+            if (!(flags & (CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG))) {
+                if (std::filesystem::create_directories(directory))
+                    std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+            }
+            persistent_store(*result, directory / (name + ".db"), flags);
+        }
+    } else if (id > 0xffff && std::strcmp(provider, SYS_CERT_STORE_PROV_SQLITE) == 0) {
+        require(parameter && !(flags & 0xff0000) && !native_write, E_INVALIDARG, "SQLite provider requires an absolute UTF-8 path and no location/native flags");
+        persistent_store(*result, static_cast<LPCSTR>(parameter), flags);
+    } else if (id > 0xffff && std::strcmp(provider, SYS_CERT_STORE_PROV_NATIVE) == 0) {
+        require(!(flags & (0xff0000 | CERT_STORE_CREATE_NEW_FLAG)), E_INVALIDARG, "Invalid native store flags");
+        result->native = true;
+        result->readonly = !native_write;
+        result->layout = native_layout(static_cast<const SYS_CERT_NATIVE_OPTIONS*>(parameter));
+        load_native(*result);
+    } else throw Error(ERROR_NOT_SUPPORTED, "Store provider is not supported");
+    return publish_store(std::move(result));
+}
+
+PCCERT_CONTEXT add(Store& store, std::shared_ptr<Store> owner, Context& source, DWORD disposition, bool output) {
+    writable(store);
+    require(disposition >= 1 && disposition <= 7, E_INVALIDARG, "Invalid certificate add disposition");
+    refresh_properties(source);
+    Transaction transaction(*store.db);
+    NewObject pending;
+    std::unique_ptr<Context> existing;
+    sqlite3_int64 old_row = 0;
+    if (disposition != CERT_STORE_ADD_ALWAYS) {
+        Statement query(store.db->value, "SELECT id FROM certificates ORDER BY id");
+        while (query.step()) {
+            auto candidate = load_context(store, sqlite3_column_int64(query.value, 0));
+            if (!same_identity(*candidate, source)) continue;
+            old_row = sqlite3_column_int64(query.value, 0);
+            candidate->store = owner;
+            ++store.contexts;
+            candidate->row = old_row;
+            refresh_properties(*candidate);
+            existing = std::move(candidate);
+            break;
+        }
+    }
+    if (existing) {
+        require(disposition != CERT_STORE_ADD_NEW, CRYPT_E_EXISTS, "Certificate already exists");
+        if (disposition == CERT_STORE_ADD_NEWER || disposition == CERT_STORE_ADD_NEWER_INHERIT_PROPERTIES)
+            require(ASN1_TIME_compare(X509_get0_notBefore(source.certificate.get()),
+                X509_get0_notBefore(existing->certificate.get())) == 1, CRYPT_E_EXISTS, "Existing certificate is not older");
+    }
+    if (store.native) {
+        require(!source.private_key, ERROR_NOT_SUPPORTED, "Private keys cannot be installed into the system ROOT store");
+        require(source.properties.empty(), ERROR_NOT_SUPPORTED, "Native ROOT certificate properties are not persisted in this release");
+        require(disposition != CERT_STORE_ADD_ALWAYS, ERROR_NOT_SUPPORTED, "Native trust anchors are unique; use ADD_NEW or ADD_REPLACE_EXISTING");
+        require(!existing || source.der == existing->der, ERROR_NOT_SUPPORTED,
+            "Replacing a native root with different certificate bytes requires explicit deletion first");
+        if (!existing) update_anchor(source.certificate.get(), true, store.layout);
+    }
+    Properties properties = source.properties;
+    bool use_existing = existing && (disposition == CERT_STORE_ADD_USE_EXISTING ||
+        disposition == CERT_STORE_ADD_REPLACE_EXISTING_INHERIT_PROPERTIES);
+    if (existing && (disposition == CERT_STORE_ADD_REPLACE_EXISTING_INHERIT_PROPERTIES ||
+        disposition == CERT_STORE_ADD_NEWER_INHERIT_PROPERTIES || use_existing)) {
+        auto merged = existing->properties;
+        for (const auto& [id, value] : properties) merged[id] = value;
+        properties = std::move(merged);
+    }
+    sqlite3_int64 row = old_row;
+    if (!use_existing || (source.private_key && !store.objects.empty())) {
+        if (existing) {
+            snapshot_row(owner, old_row);
+            retire_row(store, old_row);
+        }
+        Context material(use_existing ? existing->der : source.der);
+        material.private_key = source.private_key ? source.private_key : (existing ? existing->private_key : SharedKey{});
+        row = insert_material(store, material, pending);
+    } else if (source.private_key && store.objects.empty()) {
+        store.memory.at(row).key = source.private_key;
+    }
+    write_properties(store, row, properties);
+    std::unique_ptr<Context> result;
+    if (output) {
+        result = load_context(store, row);
+        result->properties = properties;
+    }
+    transaction.commit();
+    pending.committed = true;
+    if (existing && row != old_row) store.memory.erase(old_row);
+    collect_garbage(store);
+    return output ? publish(std::move(result), std::move(owner), row) : nullptr;
+}
+
+struct PfxBagCount { unsigned keys = 0; unsigned certificates = 0; };
+void inspect_bags(const STACK_OF(PKCS12_SAFEBAG)* bags, PfxBagCount& count, unsigned depth) {
+    require(depth < 16, ERROR_INVALID_DATA, "PKCS#12 safe nesting is too deep");
+    for (int i = 0; i < sk_PKCS12_SAFEBAG_num(bags); ++i) {
+        auto* bag = sk_PKCS12_SAFEBAG_value(bags, i);
+        switch (PKCS12_SAFEBAG_get_nid(bag)) {
+        case NID_keyBag: case NID_pkcs8ShroudedKeyBag: ++count.keys; break;
+        case NID_certBag:
+            require(PKCS12_SAFEBAG_get_bag_nid(bag) == NID_x509Certificate, ERROR_NOT_SUPPORTED, "Unsupported PKCS#12 certificate bag");
+            ++count.certificates;
+            break;
+        case NID_safeContentsBag: inspect_bags(PKCS12_SAFEBAG_get0_safes(bag), count, depth + 1); break;
+        default: throw Error(ERROR_NOT_SUPPORTED, "Unsupported PKCS#12 bag; import would lose data");
+        }
+    }
+}
+std::vector<std::unique_ptr<Context>> parse_pfx(const CRYPT_DATA_BLOB* blob, LPCWSTR password, DWORD flags) {
+    require(flags == 0 || flags == CRYPT_EXPORTABLE || flags == CRYPT_USER_KEYSET ||
+        flags == (CRYPT_EXPORTABLE | CRYPT_USER_KEYSET), ERROR_NOT_SUPPORTED,
+        "Only user-keyset, filesystem-protected PKCS#12 imports are supported");
+    require(blob && blob->pbData && blob->cbData, E_INVALIDARG, "Empty PKCS#12 input");
+    auto secret = password ? utf8(password) : std::string{};
+    struct Cleanse { std::string& value; ~Cleanse() { OPENSSL_cleanse(value.data(), value.size()); } } cleanse{secret};
+    require(secret.size() <= static_cast<std::size_t>(INT_MAX), E_INVALIDARG, "PKCS#12 password is too long");
+    const BYTE* cursor = blob->pbData;
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> pfx(d2i_PKCS12(nullptr, &cursor, blob->cbData), PKCS12_free);
+    require(pfx && cursor == blob->pbData + blob->cbData, ERROR_INVALID_DATA, "Invalid PKCS#12 encoding or trailing bytes");
+    require(PKCS12_mac_present(pfx.get()), ERROR_NOT_SUPPORTED, "Unauthenticated PKCS#12 input is not supported");
+    const char* pass = secret.c_str();
+    if (PKCS12_verify_mac(pfx.get(), pass, static_cast<int>(secret.size())) != 1) {
+        require(secret.empty() && PKCS12_verify_mac(pfx.get(), nullptr, 0) == 1,
+            ERROR_INVALID_DATA, "PKCS#12 password or integrity check failed");
+        pass = nullptr;
+    }
+    auto free_safes = [](STACK_OF(PKCS7)* value) { sk_PKCS7_pop_free(value, PKCS7_free); };
+    std::unique_ptr<STACK_OF(PKCS7), decltype(free_safes)> safes(PKCS12_unpack_authsafes(pfx.get()), free_safes);
+    require(safes != nullptr, ERROR_INVALID_DATA, "Invalid PKCS#12 authenticated safes");
+    PfxBagCount count;
+    for (int i = 0; i < sk_PKCS7_num(safes.get()); ++i) {
+        auto* safe = sk_PKCS7_value(safes.get(), i);
+        require(PKCS7_type_is_data(safe) || PKCS7_type_is_encrypted(safe), ERROR_NOT_SUPPORTED, "Unsupported PKCS#12 safe type");
+        auto free_bags = [](STACK_OF(PKCS12_SAFEBAG)* value) { sk_PKCS12_SAFEBAG_pop_free(value, PKCS12_SAFEBAG_free); };
+        std::unique_ptr<STACK_OF(PKCS12_SAFEBAG), decltype(free_bags)> bags(
+            PKCS7_type_is_data(safe) ? PKCS12_unpack_p7data(safe) :
+                PKCS12_unpack_p7encdata(safe, pass, static_cast<int>(secret.size())), free_bags);
+        require(bags != nullptr, ERROR_INVALID_DATA, "Cannot decrypt PKCS#12 safe");
+        inspect_bags(bags.get(), count, 0);
+    }
+    require(count.keys <= 1, ERROR_NOT_SUPPORTED, "Multiple private keys in one PKCS#12 file are not supported");
+    EVP_PKEY* raw_key = nullptr;
+    X509* raw_leaf = nullptr;
+    STACK_OF(X509)* raw_chain = nullptr;
+    int parsed = PKCS12_parse(pfx.get(), pass, &raw_key, &raw_leaf, &raw_chain);
+    SharedKey key(raw_key, EVP_PKEY_free);
+    X509Ptr leaf(raw_leaf, X509_free);
+    auto free_chain = [](STACK_OF(X509)* value) { sk_X509_pop_free(value, X509_free); };
+    std::unique_ptr<STACK_OF(X509), decltype(free_chain)> chain(raw_chain, free_chain);
+    require(parsed == 1, ERROR_INVALID_DATA, "Cannot parse PKCS#12 certificate/key contents");
+    require(!key || (leaf && X509_check_private_key(leaf.get(), key.get()) == 1), ERROR_INVALID_DATA, "PKCS#12 key has no matching certificate");
+    std::vector<std::unique_ptr<Context>> result;
+    if (leaf) {
+        auto context = std::make_unique<Context>(encode_x509(leaf.get()));
+        context->private_key = key;
+        result.push_back(std::move(context));
+    }
+    for (int i = 0; i < sk_X509_num(chain.get()); ++i)
+        result.push_back(std::make_unique<Context>(encode_x509(sk_X509_value(chain.get(), i))));
+    require(!result.empty() && result.size() == count.certificates && count.keys == (key ? 1u : 0u),
+        ERROR_NOT_SUPPORTED, "PKCS#12 contains material that cannot be preserved by this importer");
+    return result;
+}
+void import_pfx(Store& store, std::vector<std::unique_ptr<Context>>& certificates) {
+    writable(store);
+    require(!store.objects.empty() && !store.native, ERROR_NOT_SUPPORTED, "PKCS#12 imports require a file-backed logical store");
+    std::vector<std::unique_ptr<NewObject>> objects;
+    Transaction transaction(*store.db);
+    for (const auto& context : certificates) {
+        auto pending = std::make_unique<NewObject>();
+        insert_material(store, *context, *pending);
+        objects.push_back(std::move(pending));
+    }
+    transaction.commit();
+    for (auto& object : objects) object->committed = true;
+}
+} // namespace
+
+Bytes encode_x509(X509* certificate) {
+    int length = i2d_X509(certificate, nullptr);
+    require(length > 0, ERROR_INVALID_DATA, "Cannot encode certificate");
+    Bytes result(static_cast<std::size_t>(length));
+    auto* cursor = result.data();
+    require(i2d_X509(certificate, &cursor) == length, ERROR_INVALID_DATA, "Cannot encode certificate");
+    return result;
+}
+} // namespace scs
+
+using namespace scs;
+
+extern "C" {
+DWORD GetLastError() noexcept { return last_error; }
+void SetLastError(DWORD error) noexcept { report(error, ""); }
+const char* SysCertGetLastErrorMessage() noexcept { return last_message.data(); }
+
+HCERTSTORE CertOpenStore(LPCSTR provider, DWORD encoding, HCRYPTPROV_LEGACY legacy, DWORD flags, const void* parameter) noexcept {
+    return boundary<HCERTSTORE>(nullptr, [&] { return open_store(provider, encoding, legacy, flags, parameter); });
+}
+HCERTSTORE CertOpenSystemStoreW(HCRYPTPROV_LEGACY legacy, LPCWSTR name) noexcept {
+    return CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, legacy, CERT_SYSTEM_STORE_CURRENT_USER, name);
+}
+HCERTSTORE CertOpenSystemStoreA(HCRYPTPROV_LEGACY legacy, LPCSTR name) noexcept {
+    return CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, legacy, CERT_SYSTEM_STORE_CURRENT_USER, name);
+}
+HCERTSTORE CertDuplicateStore(HCERTSTORE store) noexcept {
+    return boundary<HCERTSTORE>(nullptr, [&] { ++get_store(store)->references; return store; });
+}
+BOOL CertCloseStore(HCERTSTORE handle, DWORD flags) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        auto store = get_store(handle);
+        require((flags & ~CERT_CLOSE_STORE_CHECK_FLAG) == 0, ERROR_NOT_SUPPORTED, "Forced close is not supported");
+        bool pending = store->contexts != 0;
+        if (store->references == 1) {
+            for (auto& [key, context] : contexts) {
+                (void)key;
+                if (context->store == store) refresh_properties(*context);
+            }
+        }
+        if (--store->references == 0) stores.erase(handle);
+        require(!(pending && (flags & CERT_CLOSE_STORE_CHECK_FLAG)), CRYPT_E_PENDING_CLOSE, "Store closed with outstanding contexts");
+        return TRUE;
+    });
+}
+PCCERT_CONTEXT CertCreateCertificateContext(DWORD encoding, const BYTE* encoded, DWORD size) noexcept {
+    return boundary<PCCERT_CONTEXT>(nullptr, [&] {
+        encoding_check(encoding);
+        return publish(std::make_unique<Context>(bytes(encoded, size)));
+    });
+}
+PCCERT_CONTEXT CertDuplicateCertificateContext(PCCERT_CONTEXT context) noexcept {
+    return boundary<PCCERT_CONTEXT>(nullptr, [&] { ++get_context(context).references; return context; });
+}
+BOOL CertFreeCertificateContext(PCCERT_CONTEXT context) noexcept {
+    return boundary<BOOL>(FALSE, [&] { release(context); return TRUE; });
+}
+PCCERT_CONTEXT CertEnumCertificatesInStore(HCERTSTORE store, PCCERT_CONTEXT previous) noexcept {
+    return CertFindCertificateInStore(store, X509_ASN_ENCODING, 0, CERT_FIND_ANY, nullptr, previous);
+}
+PCCERT_CONTEXT CertFindCertificateInStore(HCERTSTORE store, DWORD encoding, DWORD flags,
+    DWORD type, const void* parameter, PCCERT_CONTEXT previous) noexcept {
+    return boundary<PCCERT_CONTEXT>(nullptr, [&] {
+        Consume consume(previous);
+        encoding_check(encoding);
+        require(flags == 0, ERROR_NOT_SUPPORTED, "Find flags are unsupported");
+        return find(store, type, parameter, previous);
+    });
+}
+PCCERT_CONTEXT CertGetSubjectCertificateFromStore(HCERTSTORE store, DWORD encoding, PCERT_INFO id) noexcept {
+    return CertFindCertificateInStore(store, encoding, 0, CERT_FIND_SUBJECT_CERT, id, nullptr);
+}
+PCCERT_CONTEXT CertGetIssuerCertificateFromStore(HCERTSTORE handle, PCCERT_CONTEXT subject,
+    PCCERT_CONTEXT previous, DWORD* flags) noexcept {
+    return boundary<PCCERT_CONTEXT>(nullptr, [&]() -> PCCERT_CONTEXT {
+        Consume consume(previous);
+        require(flags, E_INVALIDARG, "Missing issuer verification flags");
+        require((*flags & ~(CERT_STORE_SIGNATURE_FLAG | CERT_STORE_TIME_VALIDITY_FLAG)) == 0,
+            ERROR_NOT_SUPPORTED, "Only signature and validity issuer checks are supported");
+        auto& source = get_context(subject);
+        auto* x = source.certificate.get();
+        auto* subject_key = X509_get0_pubkey(x);
+        require(X509_NAME_cmp(X509_get_subject_name(x), X509_get_issuer_name(x)) != 0 ||
+            !subject_key || X509_verify(x, subject_key) != 1, CRYPT_E_SELF_SIGNED, "Subject is self-signed");
+        PCCERT_CONTEXT result = nullptr;
+        try { result = find(handle, CERT_FIND_ISSUER_OF, subject, previous); }
+        catch (const Error& error) {
+            if (error.code == CRYPT_E_NOT_FOUND && (*flags & CERT_STORE_SIGNATURE_FLAG)) *flags |= CERT_STORE_NO_ISSUER_FLAG;
+            throw;
+        }
+        auto* issuer = get_context(result).certificate.get();
+        auto* issuer_key = X509_get0_pubkey(issuer);
+        if ((*flags & CERT_STORE_SIGNATURE_FLAG) && issuer_key && X509_verify(x, issuer_key) == 1)
+            *flags &= ~CERT_STORE_SIGNATURE_FLAG;
+        if ((*flags & CERT_STORE_TIME_VALIDITY_FLAG) && X509_cmp_current_time(X509_get0_notBefore(x)) < 0 &&
+            X509_cmp_current_time(X509_get0_notAfter(x)) > 0)
+            *flags &= ~CERT_STORE_TIME_VALIDITY_FLAG;
+        return result;
+    });
+}
+BOOL CertAddCertificateContextToStore(HCERTSTORE handle, PCCERT_CONTEXT context, DWORD disposition, PCCERT_CONTEXT* result) noexcept {
+    if (result) *result = nullptr;
+    return boundary<BOOL>(FALSE, [&] {
+        auto store = get_store(handle);
+        auto added = add(*store, store, get_context(context), disposition, result != nullptr);
+        if (result) *result = added;
+        return TRUE;
+    });
+}
+BOOL CertAddEncodedCertificateToStore(HCERTSTORE handle, DWORD encoding, const BYTE* encoded,
+    DWORD size, DWORD disposition, PCCERT_CONTEXT* result) noexcept {
+    if (result) *result = nullptr;
+    return boundary<BOOL>(FALSE, [&] {
+        encoding_check(encoding);
+        Context source(bytes(encoded, size));
+        auto store = get_store(handle);
+        auto added = add(*store, store, source, disposition, result != nullptr);
+        if (result) *result = added;
+        return TRUE;
+    });
+}
+BOOL CertDeleteCertificateFromStore(PCCERT_CONTEXT context) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        Consume consume(context);
+        auto& source = get_context(context);
+        require(source.store != nullptr, E_INVALIDARG, "Certificate does not belong to a store");
+        require(source.store->references != 0, ERROR_INVALID_HANDLE, "Certificate store is closed");
+        writable(*source.store);
+        snapshot_row(source.store, source.row);
+        if (source.store->native) remove_trusted_certificate(source.certificate.get(), source.store->layout);
+        Transaction transaction(*source.store->db);
+        retire_row(*source.store, source.row);
+        transaction.commit();
+        source.store->memory.erase(source.row);
+        collect_garbage(*source.store);
+        return TRUE;
+    });
+}
+BOOL CertGetCertificateContextProperty(PCCERT_CONTEXT context, DWORD property, void* data, DWORD* size) noexcept {
+    return boundary<BOOL>(FALSE, [&] { copy_out(property_value(get_context(context), property), data, size); return TRUE; });
+}
+BOOL CertSetCertificateContextProperty(PCCERT_CONTEXT context, DWORD property, DWORD flags, const void* data) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(flags == 0, ERROR_NOT_SUPPORTED, "Property flags are unsupported");
+        require(supported_property(property), ERROR_NOT_SUPPORTED, "Certificate property is unsupported");
+        require(property != CERT_SHA1_HASH_PROP_ID && property != CERT_SHA256_HASH_PROP_ID && property != CERT_MD5_HASH_PROP_ID,
+            ERROR_NOT_SUPPORTED, "Computed certificate hashes cannot be overridden");
+        auto& target = get_context(context);
+        refresh_properties(target);
+        auto updated = target.properties;
+        if (!data) updated.erase(property);
+        else {
+            const auto& blob = *static_cast<const CRYPT_DATA_BLOB*>(data);
+            auto value = bytes(blob.pbData, blob.cbData);
+            if (property == CERT_FRIENDLY_NAME_PROP_ID || property == CERT_DESCRIPTION_PROP_ID) {
+                require(value.size() >= sizeof(WCHAR) && value.size() % sizeof(WCHAR) == 0,
+                    E_INVALIDARG, "Text property must be a native-WCHAR string including its terminator");
+                WCHAR terminator = 1;
+                std::memcpy(&terminator, value.data() + value.size() - sizeof(WCHAR), sizeof(WCHAR));
+                require(terminator == 0, E_INVALIDARG, "Text property is not null terminated");
+            }
+            updated[property] = std::move(value);
+        }
+        if (row_exists(target)) {
+            writable(*target.store);
+            require(!target.store->native, ERROR_NOT_SUPPORTED, "Native ROOT property persistence is not implemented");
+            if (data) write_properties(*target.store, target.row, {{property, updated.at(property)}});
+            else {
+                Statement remove(target.store->db->value, "DELETE FROM properties WHERE cert=? AND property=?");
+                remove.integer(1, target.row);
+                remove.integer(2, property);
+                remove.step();
+            }
+        }
+        target.properties = std::move(updated);
+        return TRUE;
+    });
+}
+DWORD CertEnumCertificateContextProperties(PCCERT_CONTEXT context, DWORD previous) noexcept {
+    return boundary<DWORD>(0, [&] {
+        auto& target = get_context(context);
+        refresh_properties(target);
+        auto next = target.properties.upper_bound(previous);
+        return next == target.properties.end() ? DWORD{0} : next->first;
+    });
+}
+BOOL CertGetStoreProperty(HCERTSTORE handle, DWORD property, void* data, DWORD* size) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        auto store = get_store(handle);
+        require(property == CERT_STORE_LOCALIZED_NAME_PROP_ID ||
+            (property >= CERT_FIRST_USER_PROP_ID && property <= CERT_LAST_USER_PROP_ID),
+            ERROR_NOT_SUPPORTED, "Unsupported store property");
+        Statement query(store->db->value, "SELECT value FROM store_properties WHERE property=?");
+        query.integer(1, property);
+        require(query.step(), CRYPT_E_NOT_FOUND, "Store property is not set");
+        copy_out(query.blob_column(0), data, size);
+        return TRUE;
+    });
+}
+BOOL CertSetStoreProperty(HCERTSTORE handle, DWORD property, DWORD flags, const void* data) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        auto store = get_store(handle);
+        writable(*store);
+        require(!store->native, ERROR_NOT_SUPPORTED, "Native ROOT store-property persistence is not implemented");
+        require(flags == 0, ERROR_NOT_SUPPORTED, "Store property flags are unsupported");
+        require(property == CERT_STORE_LOCALIZED_NAME_PROP_ID ||
+            (property >= CERT_FIRST_USER_PROP_ID && property <= CERT_LAST_USER_PROP_ID),
+            ERROR_NOT_SUPPORTED, "Unsupported store property");
+        if (data) {
+            const auto& blob = *static_cast<const CRYPT_DATA_BLOB*>(data);
+            Statement insert(store->db->value, "INSERT OR REPLACE INTO store_properties(property,value) VALUES(?,?)");
+            insert.integer(1, property);
+            insert.blob(2, bytes(blob.pbData, blob.cbData));
+            insert.step();
+        } else {
+            Statement remove(store->db->value, "DELETE FROM store_properties WHERE property=?");
+            remove.integer(1, property);
+            remove.step();
+        }
+        return TRUE;
+    });
+}
+BOOL CertControlStore(HCERTSTORE handle, DWORD flags, DWORD control, const void* parameter) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        auto store = get_store(handle);
+        require(flags == 0 && !parameter, ERROR_NOT_SUPPORTED, "Control flags and parameters are unsupported");
+        if (control == CERT_STORE_CTRL_RESYNC) {
+            if (store->native) {
+                require(store->contexts == 0, ERROR_BUSY, "Release native contexts before resynchronizing");
+                load_native(*store);
+            }
+        } else if (control == CERT_STORE_CTRL_COMMIT) {
+            writable(*store);
+            // Every SQLite mutation is committed before the API returns.
+            db_check(store->db->value, sqlite3_db_cacheflush(store->db->value));
+        } else throw Error(ERROR_NOT_SUPPORTED, "Store control operation is unsupported");
+        return TRUE;
+    });
+}
+BOOL CertSaveStore(HCERTSTORE handle, DWORD encoding, DWORD saveAs, DWORD saveTo, void* parameter, DWORD flags) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(encoding == PKCS_7_ASN_ENCODING || encoding == (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING),
+            ERROR_NOT_SUPPORTED, "PKCS#7 save requires PKCS_7_ASN_ENCODING");
+        require(saveAs == CERT_STORE_SAVE_AS_PKCS7 && saveTo == CERT_STORE_SAVE_TO_MEMORY && flags == 0,
+            ERROR_NOT_SUPPORTED, "Only PKCS#7 export to memory is implemented");
+        require(parameter, E_INVALIDARG, "Missing output blob");
+        auto store = get_store(handle);
+        std::unique_ptr<PKCS7, decltype(&PKCS7_free)> message(PKCS7_new(), PKCS7_free);
+        require(message && PKCS7_set_type(message.get(), NID_pkcs7_signed) == 1 &&
+            PKCS7_content_new(message.get(), NID_pkcs7_data) == 1, ERROR_GEN_FAILURE, "Cannot create PKCS#7 container");
+        Statement query(store->db->value, "SELECT id FROM certificates ORDER BY id");
+        while (query.step()) {
+            auto certificate = load_context(*store, sqlite3_column_int64(query.value, 0));
+            require(PKCS7_add_certificate(message.get(), certificate->certificate.get()) == 1,
+                ERROR_GEN_FAILURE, "Cannot add certificate to PKCS#7 container");
+        }
+        int size = i2d_PKCS7(message.get(), nullptr);
+        require(size > 0, ERROR_GEN_FAILURE, "PKCS#7 encoding failed");
+        Bytes encoded(static_cast<std::size_t>(size));
+        auto* cursor = encoded.data();
+        require(i2d_PKCS7(message.get(), &cursor) == size, ERROR_GEN_FAILURE, "PKCS#7 encoding failed");
+        auto& output = *static_cast<CRYPT_DATA_BLOB*>(parameter);
+        copy_out(encoded, output.pbData, &output.cbData);
+        return TRUE;
+    });
+}
+BOOL SysCertUpdateTrustAnchor(PCCERT_CONTEXT certificate, BOOL install, const SYS_CERT_NATIVE_OPTIONS* options, DWORD flags) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(flags == SYS_CERT_TRUST_UPDATE_ALLOW, ERROR_ACCESS_DENIED, "Native trust update requires explicit SYS_CERT_TRUST_UPDATE_ALLOW");
+        require(install == TRUE || install == FALSE, E_INVALIDARG, "Invalid install argument");
+        if (install) update_anchor(get_context(certificate).certificate.get(), true, native_layout(options));
+        else remove_trusted_certificate(get_context(certificate).certificate.get(), native_layout(options));
+        return TRUE;
+    });
+}
+BOOL SysCertImportPfxToStore(HCERTSTORE handle, const CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flags) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        auto store = get_store(handle);
+        auto parsed = parse_pfx(pfx, password, flags);
+        import_pfx(*store, parsed);
+        return TRUE;
+    });
+}
+HCERTSTORE PFXImportCertStore(CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flags) noexcept {
+    return boundary<HCERTSTORE>(nullptr, [&] {
+        auto parsed = parse_pfx(pfx, password, flags);
+        auto directory = user_data_directory();
+        if (std::filesystem::create_directories(directory))
+            std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+        auto store = std::make_shared<Store>();
+        persistent_store(*store, directory / ("IMPORT-" + object_id() + ".db"), CERT_STORE_CREATE_NEW_FLAG);
+        import_pfx(*store, parsed);
+        return publish_store(std::move(store));
+    });
+}
+BOOL SysCertGetCertificateFilePath(PCCERT_CONTEXT certificate, BOOL privateKey, char* path, DWORD* size) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(privateKey == FALSE || privateKey == TRUE, E_INVALIDARG, "Invalid key-path selector");
+        auto& context = get_context(certificate);
+        require(!context.object_path.empty(), ERROR_NOT_SUPPORTED, "Context has no logical-store object path");
+        require(!privateKey || context.private_key, CRYPT_E_NOT_FOUND, "Certificate has no private-key file");
+        auto name = (context.object_path / (privateKey ? "private-key.pem" : "certificate.pem")).string();
+        name.push_back('\0');
+        copy_out(Bytes(name.begin(), name.end()), path, size);
+        return TRUE;
+    });
+}
+}

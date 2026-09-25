@@ -1,0 +1,8 @@
+/build*/
+/out/
+*.db
+*.db-shm
+*.db-wal
+*.db.objects/
+*.pfx
+*.p12

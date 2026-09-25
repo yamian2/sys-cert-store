@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(sys_cert_store_consumer LANGUAGES CXX)
+find_package(sys-cert-store CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE sys-cert-store::sys-cert-store)
