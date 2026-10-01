@@ -5,74 +5,13 @@ signatures and ownership conventions for source-level porting. This is an
 **initial core implementation, not a complete Crypt32 replacement**. The full
 scope and remaining APIs are tracked in [API compatibility](docs/api-compatibility.md).
 
-The initial development environment is Ubuntu 24.04 under WSL. Red Hat-family
-Linux and Microsoft Azure Linux are build targets, with Azure Linux the final
-deployment target. The current dependency baseline is **OpenSSL 3**, SQLite
+Builds under Ubuntu, Red Hat and Microsoft Azure Linux, with Azure Linux the final
+deployment target. 
+
+The current dependency baseline is **OpenSSL 3**, SQLite
 3.31 or newer, CMake 3.20, and a C++20 compiler. Older CBL-Mariner installations
 with OpenSSL 1.1 require a future compatibility port.
 
-## Storage
-
-**Files are authoritative; SQLite is a metadata index.** Each logical-store
-certificate is a PEM file in its own directory. If it has an associated private
-key, that directory also contains an unencrypted PKCS#8 PEM file protected by
-Linux ownership and permissions. SQLite contains only object references,
-extended properties, store properties and pending-deletion metadata, never
-certificate DER/PEM or private-key contents. Everything survives process restarts.
-
-| Store | Backing storage |
-| --- | --- |
-| `CERT_STORE_PROV_MEMORY` | Temporary C++ certificate/key objects and in-memory metadata; no files |
-| Current-user named stores (`ROOT`, `CA`, `MY`, or another logical name) | `<effective-user-home>/.local/share/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
-| Local-machine named stores other than `ROOT` | `/var/lib/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
-| Computer `ROOT` | Snapshot of native TLS trust; opt-in writes modify distro sources and regenerate trust |
-| `SYS_CERT_STORE_PROV_SQLITE` | Caller-selected absolute metadata filename, plus adjacent `<filename>.objects/` |
-
-For example, importing into current-user `MY` creates:
-
-```text
-MY.db                            # metadata only
-MY.db.objects/
-  <random-object-id>/
-    certificate.pem
-    private-key.pem              # only when the import contains a matching key
-```
-
-User/explicit-store object directories use mode `0700`; certificate, private-key
-and new database files use `0600`. Computer stores expose certificate files and
-metadata with `0644` and their directories with `0755`, while private keys remain
-`0600` inside a separate `0700` `keys/` directory. Certificate enumeration never
-opens private keys. Copying a key or requesting its path requires access to that
-protected file. Do not place secrets in computer-store properties.
-Certificate files are flushed before metadata commits.
-Deletion removes the certificate **and its corresponding private-key file**.
-A metadata garbage queue retries interrupted post-commit deletions when the
-store is next opened writable. A crash before a new object's metadata commit
-can leave an unreferenced object directory; automatic orphan sweeping is not
-implemented. Back up both the metadata and object tree together while writers
-are stopped. This is not a distributed transaction across arbitrary filesystems.
-
-The effective user's home comes from the account database,
-not environment variables. Store names are case-insensitive ASCII letters,
-digits, `_` and `-`, up to 64 characters. `CA` stores intermediate CA files but
-does **not** promote them to trusted roots. Linux has no universal native
-equivalent of Windows `MY`/`CA`; their object hierarchy is library-managed.
-The distro layout is used for native roots. Properties must not contain private-key material.
-
-PKCS#12 imports preserve a matching private key and all certificates in the
-bundle. `SysCertImportPfxToStore` imports directly into a chosen persistent
-logical store. `PFXImportCertStore` returns a newly created persistent
-`IMPORT-<id>.db` store in the user's library directory by default or the computer
-directory with `CRYPT_MACHINE_KEYSET`, unlike Windows'
-temporary returned certificate store. Closing it does not delete its files.
-`SysCertGetCertificateFilePath` returns the certificate or key filename.
-Multi-key PFX files and unsupported bag types fail rather than dropping material.
-An import containing certificates alone cannot produce private keys.
-
-Computer `ROOT` exposes system TLS trust, not every certificate found somewhere below
-`/etc`. Loading only the distro's generated bundle respects which anchors the
-distro includes for TLS. This is not a full representation of p11-kit
-purpose-specific trust or distrust metadata.
 
 ## User and computer stores
 
@@ -315,6 +254,70 @@ after external changes. Release native contexts before resynchronizing.
 chroot or security sandbox**. Do not copy a real distro updater into a fixture
 tree: that program can still act on absolute host paths. Use only trusted,
 purpose-built fixture executables there.
+
+## Storage
+
+**Files are authoritative; SQLite is a metadata index.** Each logical-store
+certificate is a PEM file in its own directory. If it has an associated private
+key, that directory also contains an unencrypted PKCS#8 PEM file protected by
+Linux ownership and permissions. SQLite contains only object references,
+extended properties, store properties and pending-deletion metadata, never
+certificate DER/PEM or private-key contents. Everything survives process restarts.
+
+| Store | Backing storage |
+| --- | --- |
+| `CERT_STORE_PROV_MEMORY` | Temporary C++ certificate/key objects and in-memory metadata; no files |
+| Current-user named stores (`ROOT`, `CA`, `MY`, or another logical name) | `<effective-user-home>/.local/share/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
+| Local-machine named stores other than `ROOT` | `/var/lib/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
+| Computer `ROOT` | Snapshot of native TLS trust; opt-in writes modify distro sources and regenerate trust |
+| `SYS_CERT_STORE_PROV_SQLITE` | Caller-selected absolute metadata filename, plus adjacent `<filename>.objects/` |
+
+For example, importing into current-user `MY` creates:
+
+```text
+MY.db                            # metadata only
+MY.db.objects/
+  <random-object-id>/
+    certificate.pem
+    private-key.pem              # only when the import contains a matching key
+```
+
+User/explicit-store object directories use mode `0700`; certificate, private-key
+and new database files use `0600`. Computer stores expose certificate files and
+metadata with `0644` and their directories with `0755`, while private keys remain
+`0600` inside a separate `0700` `keys/` directory. Certificate enumeration never
+opens private keys. Copying a key or requesting its path requires access to that
+protected file. Do not place secrets in computer-store properties.
+Certificate files are flushed before metadata commits.
+Deletion removes the certificate **and its corresponding private-key file**.
+A metadata garbage queue retries interrupted post-commit deletions when the
+store is next opened writable. A crash before a new object's metadata commit
+can leave an unreferenced object directory; automatic orphan sweeping is not
+implemented. Back up both the metadata and object tree together while writers
+are stopped. This is not a distributed transaction across arbitrary filesystems.
+
+The effective user's home comes from the account database,
+not environment variables. Store names are case-insensitive ASCII letters,
+digits, `_` and `-`, up to 64 characters. `CA` stores intermediate CA files but
+does **not** promote them to trusted roots. Linux has no universal native
+equivalent of Windows `MY`/`CA`; their object hierarchy is library-managed.
+The distro layout is used for native roots. Properties must not contain private-key material.
+
+PKCS#12 imports preserve a matching private key and all certificates in the
+bundle. `SysCertImportPfxToStore` imports directly into a chosen persistent
+logical store. `PFXImportCertStore` returns a newly created persistent
+`IMPORT-<id>.db` store in the user's library directory by default or the computer
+directory with `CRYPT_MACHINE_KEYSET`, unlike Windows'
+temporary returned certificate store. Closing it does not delete its files.
+`SysCertGetCertificateFilePath` returns the certificate or key filename.
+Multi-key PFX files and unsupported bag types fail rather than dropping material.
+
+
+Computer `ROOT` exposes system TLS trust, not every certificate found somewhere below
+`/etc`. Loading only the distro's generated bundle respects which anchors the
+distro includes for TLS. This is not a full representation of p11-kit
+purpose-specific trust or distrust metadata.
+
 
 ## Implementation boundaries
 
