@@ -5,13 +5,96 @@ signatures and ownership conventions for source-level porting. This is an
 **initial core implementation, not a complete Crypt32 replacement**. The full
 scope and remaining APIs are tracked in [API compatibility](docs/api-compatibility.md).
 
-Builds under Ubuntu, Red Hat and Microsoft Azure Linux, with Azure Linux the final
-deployment target. 
+Builds under Ubuntu, Red Hat-family distributions and Microsoft Azure Linux,
+with Azure Linux the final deployment target. The initial development
+environment is Ubuntu 24.04 under WSL. The build uses **pinned OpenSSL 3.5.8,
+SCOSSL and SymCrypt
+source**, SQLite 3.31 or newer, CMake 3.20, Perl, Python 3, GNU Make, and C/C++20
+compilers. OpenSSL calls the built-in SCOSSL provider, which uses SymCrypt.
+All three crypto dependencies are linked statically; system OpenSSL headers,
+libraries and provider modules are not used.
 
-The current dependency baseline is **OpenSSL 3**, SQLite
-3.31 or newer, CMake 3.20, and a C++20 compiler. Older CBL-Mariner installations
-with OpenSSL 1.1 require a future compatibility port.
+## Storage
 
+**Files are authoritative; SQLite is a metadata index.** Each logical-store
+certificate is a PEM file in its own directory. If it has an associated private
+key, that directory also contains an unencrypted PKCS#8 PEM file protected by
+Linux ownership and permissions. SQLite contains only object references,
+extended properties, store properties and pending-deletion metadata, never
+certificate DER/PEM or private-key contents. Everything survives process restarts.
+
+| Store | Backing storage |
+| --- | --- |
+| `CERT_STORE_PROV_MEMORY` | Temporary C++ certificate/key objects and in-memory metadata; no files |
+| Current-user named stores (`ROOT`, `CA`, `MY`, or another logical name) | `<effective-user-home>/.local/share/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
+| Local-machine named stores other than `ROOT` | `/var/lib/sys-cert-store/<NAME>.db` plus `<NAME>.db.objects/` |
+| Computer `ROOT` | Snapshot of native TLS trust; opt-in writes modify distro sources and regenerate trust |
+| `SYS_CERT_STORE_PROV_SQLITE` | Caller-selected absolute metadata filename, plus adjacent `<filename>.objects/` |
+
+For example, importing into current-user `MY` creates:
+
+```text
+MY.db                            # metadata only
+MY.db.objects/
+  <random-object-id>/
+    certificate.pem
+    private-key.pem              # only when the import contains a matching key
+```
+
+User/explicit-store object directories use mode `0700`; certificate, private-key
+and new database files use `0600`. Computer stores expose certificate files and
+metadata with `0644` and their directories with `0755`, while private keys remain
+`0600` inside a separate `0700` `keys/` directory. Certificate enumeration never
+opens private keys. Copying a key or requesting its path requires access to that
+protected file. Do not place secrets in computer-store properties.
+Certificate files are flushed before metadata commits.
+Deletion removes the certificate **and its corresponding private-key file**.
+A metadata garbage queue retries interrupted post-commit deletions when the
+store is next opened writable. A crash before a new object's metadata commit
+can leave an unreferenced object directory; automatic orphan sweeping is not
+implemented. Back up both the metadata and object tree together while writers
+are stopped. This is not a distributed transaction across arbitrary filesystems.
+
+The effective user's home comes from the account database,
+not environment variables. Store names are case-insensitive ASCII letters,
+digits, `_` and `-`, up to 64 characters. `CA` stores intermediate CA files but
+does **not** promote them to trusted roots. Linux has no universal native
+equivalent of Windows `MY`/`CA`; their object hierarchy is library-managed.
+The distro layout is used for native roots. Properties must not contain private-key material.
+
+PKCS#12 imports preserve a matching private key and all certificates in the
+bundle. `SysCertImportPfxToStore` imports directly into a chosen persistent
+logical store. `PFXImportCertStore` returns a newly created persistent
+`IMPORT-<id>.db` store in the user's library directory by default or the computer
+directory with `CRYPT_MACHINE_KEYSET`, unlike Windows'
+temporary returned certificate store. Closing it does not delete its files.
+`SysCertGetCertificateFilePath` returns the certificate or key filename.
+Multi-key PFX files and unsupported bag types fail rather than dropping material.
+An import containing certificates alone cannot produce private keys.
+
+`SysCertPopulateDotNetCrlCache` preloads the private CRL cache used by .NET on
+Linux. With a UTF-8 user name, it discovers HTTP CRL distribution points from
+that user's `MY`, `CA`, and `ROOT` views and writes validated PEM CRLs below
+`.dotnet/corefx/cryptography/crls`. The current user follows `HOME`, matching
+.NET; another user follows that account's home-directory record. The caller
+must be root or the selected user.
+
+Passing `nullptr` scans `/proc/*/maps` for processes that have loaded
+`libcoreclr.so`, deduplicates their effective UIDs, discovers CDPs from the
+computer `MY`, `CA`, and `ROOT` stores, and populates each discovered account's
+cache. Restricted `/proc` visibility is reported as a failure rather than
+silently producing an incomplete result. Downloads use HTTP, require a matching
+issuer and valid CRL signature, reject future/expired CRLs, and reproduce .NET's
+`<issuer-hash>.<URL-hash>.crl` name. Cache directories are `0700`, files are
+`0600`, writes are atomic, and root assigns ownership to the target account.
+Processing is best effort: successful independent entries remain cached, but
+the function returns `FALSE` and reports an aggregate diagnostic if any
+discovered operation fails.
+
+Computer `ROOT` exposes system TLS trust, not every certificate found somewhere below
+`/etc`. Loading only the distro's generated bundle respects which anchors the
+distro includes for TLS. This is not a full representation of p11-kit
+purpose-specific trust or distrust metadata.
 
 ## User and computer stores
 
@@ -69,22 +152,59 @@ stores. Duplicate DER certificates in a native bundle are collapsed.
 
 ## Build
 
+Initialize the pinned Git submodules before configuring:
+
+```sh
+git submodule update --init --recursive
+```
+
+The submodules pin OpenSSL 3.5.8, public SCOSSL at `d73b1e9`, and public
+SymCrypt 103.13.0 at `286762b`, including SymCrypt's pinned jitterentropy source.
+Build-tree patches carry the unpublished four-variant composite support,
+SCOSSL encoder/EC-comparison cleanup, and SymCrypt curve-cache cleanup; dependency checkouts
+are not modified. No unpublished remote commit or internal source is required.
+OpenSSL uses Apache-2.0, SCOSSL and SymCrypt use MIT, and jitterentropy is used
+under its BSD license. Installation includes the dependency license files.
+
+CMake builds OpenSSL out of tree with `no-shared`, `no-module`, `no-dso` and PIC,
+and registers SCOSSL's statically linked `symcryptprovider` in-process. SymCrypt
+uses its PIC static libraries and a local POSIX runtime adapter, retaining the
+upstream startup algorithm tests, AES DRBG, kernel and jitter entropy sources,
+and fork detection. There is no system-OpenSSL fallback and no provider `.so`
+deployment. The first build takes
+longer. Static crypto symbols are hidden to avoid interposition with an
+application's own OpenSSL. The library itself remains shared, and SQLite and
+the platform runtime remain dynamic. This is not a fully static executable
+or a FIPS-validated build. The static consumer is not SymCrypt's shared FIPS
+module, does not perform that module's ELF integrity verification, and advertises
+`fips=no`. SCOSSL is preferred for supported operations, including pure and
+composite ML-DSA; OpenSSL's embedded default provider remains available for
+formats and algorithms SCOSSL does not implement. Host OpenSSL configuration
+is not loaded. Updating any embedded crypto requires rebuilding and redeploying
+this project; OS package updates do not update its embedded copies.
+
+Native Linux builds are supported; cross-compilation is explicitly rejected.
+Under WSL, a build directory on the Linux filesystem avoids the substantial
+compilation overhead of writing intermediate files under `/mnt/c`.
+The full PQC coverage and current provider limits are described in
+[PQC support](docs/pqc-support.md).
+
 Ubuntu dependencies:
 
 ```sh
-sudo apt-get install build-essential cmake libssl-dev libsqlite3-dev ca-certificates
+sudo apt-get install build-essential cmake perl python3 git libsqlite3-dev ca-certificates binutils
 ```
 
 Red Hat 9 / compatible dependencies:
 
 ```sh
-sudo dnf install gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
+sudo dnf install gcc-c++ cmake make perl-core python3 git sqlite-devel ca-certificates binutils libatomic
 ```
 
 Azure Linux 3 dependencies:
 
 ```sh
-sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install build-essential cmake openssl-devel sqlite-devel ca-certificates findutils
+sudo rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && sudo tdnf install build-essential cmake perl python3 git sqlite-devel ca-certificates findutils binutils libatomic
 ```
 
 Azure Linux package signatures use RPM's keyring, while the `tdnf` repository
@@ -329,7 +449,7 @@ Calls are serialized within a process; SQLite coordinates independent database
 connections/processes with a five-second busy timeout. Callers still own context
 lifetimes and must not free a context concurrently with code using its fields.
 
-CRLs, CTLs, general-purpose collections, link semantics, Windows serialization,
+Crypt32-compatible CRL stores/APIs, CTLs, general-purpose collections, link semantics, Windows serialization,
 CNG/KSP bridging, registration callbacks and complete Win32 flag coverage
 are planned, **not implemented or silently emulated**. Unsupported options in
 implemented functions fail explicitly. Future functions are not declared as

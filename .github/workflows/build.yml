@@ -15,7 +15,9 @@ jobs:
         sanitizers: ['OFF', 'ON']
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libssl-dev libsqlite3-dev ca-certificates
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake perl python3 git libsqlite3-dev ca-certificates binutils
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSYS_CERT_STORE_SANITIZERS=${{ matrix.sanitizers }}
       - run: cmake --build build -j 2
       - run: ctest --test-dir build --output-on-failure
@@ -27,9 +29,9 @@ jobs:
       matrix:
         include:
           - image: registry.access.redhat.com/ubi9/ubi:latest
-            install: dnf install -y gcc-c++ cmake make openssl-devel sqlite-devel ca-certificates
+            install: dnf install -y gcc-c++ cmake make perl-core python3 git sqlite-devel ca-certificates binutils libatomic
           - image: mcr.microsoft.com/azurelinux/base/core:3.0
-            install: tdnf install -y build-essential cmake openssl-devel sqlite-devel ca-certificates findutils
+            install: tdnf install -y build-essential cmake perl python3 git sqlite-devel ca-certificates findutils binutils libatomic
     container:
       image: ${{ matrix.image }}
     steps:
@@ -38,6 +40,8 @@ jobs:
         run: rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY && gpg --batch --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
       - run: ${{ matrix.install }}
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build -j 2
       - run: ctest --test-dir build --output-on-failure

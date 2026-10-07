@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "crypto.h"
 #include <openssl/asn1.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -47,6 +48,7 @@ void report(DWORD code, const char* message) noexcept {
 template<class R, class F> R boundary(R failure, F&& function) noexcept {
     try {
         std::lock_guard lock(api_mutex);
+        initialize_crypto();
         return function();
     } catch (const Error& error) {
         report(error.code, error.what());
@@ -211,6 +213,7 @@ struct Store {
     std::string name;
     std::filesystem::path pending_path;
     bool public_material = false;
+    uid_t owner = geteuid();
     std::vector<std::shared_ptr<Store>> inherited;
     std::filesystem::path objects;
     std::map<sqlite3_int64, Material> memory;
@@ -234,6 +237,7 @@ struct Context {
     std::shared_ptr<Store> view;
     sqlite3_int64 row = 0;
     std::size_t references = 1;
+    uid_t owner = geteuid();
 
     CRYPT_DATA_BLOB keep(Bytes data) {
         buffers.push_back(std::move(data));
@@ -437,7 +441,8 @@ void retire_row(Store& store, sqlite3_int64 row) {
 
 struct CloseFile { void operator()(FILE* file) const { std::fclose(file); } };
 using FileHandle = std::unique_ptr<FILE, CloseFile>;
-FileHandle open_material_file(const std::filesystem::path& path, bool write, bool shared = false) {
+FileHandle open_material_file(const std::filesystem::path& path, bool write,
+    bool shared = false, uid_t owner = geteuid()) {
     int fd = open(path.c_str(), (write ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW, shared ? 0644 : 0600);
     require(fd >= 0, errno == EACCES ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE, "Cannot open certificate/key object file");
     if (write && shared && fchmod(fd, 0644) != 0) {
@@ -446,7 +451,7 @@ FileHandle open_material_file(const std::filesystem::path& path, bool write, boo
     }
     struct stat status{};
     bool safe = fstat(fd, &status) == 0 && S_ISREG(status.st_mode) && status.st_nlink == 1 &&
-        (status.st_uid == geteuid() || (shared && status.st_uid == 0)) &&
+        (status.st_uid == owner || (shared && status.st_uid == 0)) &&
         (status.st_mode & (shared ? 022 : 077)) == 0;
     if (!safe) { close(fd); throw Error(ERROR_ACCESS_DENIED, "Object file must be private, regular and owned by the current user"); }
     FILE* file = fdopen(fd, write ? "wb" : "rb");
@@ -513,12 +518,14 @@ std::unique_ptr<Context> load_context(Store& store, sqlite3_int64 row) {
     auto directory = object_directory(store, query.text_column(0));
     struct stat status{};
     require(lstat(directory.c_str(), &status) == 0 && S_ISDIR(status.st_mode) &&
-        (status.st_uid == geteuid() || (store.public_material && status.st_uid == 0)) &&
+        (status.st_uid == store.owner || (store.public_material && status.st_uid == 0)) &&
         (status.st_mode & (store.public_material ? 022 : 077)) == 0, ERROR_ACCESS_DENIED, "Unsafe certificate object directory");
-    auto file = open_material_file(directory / "certificate.pem", false, store.public_material);
+    auto file = open_material_file(
+        directory / "certificate.pem", false, store.public_material, store.owner);
     X509Ptr certificate(PEM_read_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
     require(certificate != nullptr, ERROR_INVALID_DATA, "Invalid certificate PEM object");
     auto result = std::make_unique<Context>(encode_x509(certificate.get()));
+    result->owner = store.owner;
     result->object_path = directory;
     auto key_path = directory / "private-key.pem";
     if (lstat((directory / "keys").c_str(), &status) == 0) {
@@ -533,7 +540,7 @@ std::unique_ptr<Context> load_context(Store& store, sqlite3_int64 row) {
 }
 void load_private_key(Context& context) {
     if (context.private_key || context.key_path.empty()) return;
-    auto file = open_material_file(context.key_path, false);
+    auto file = open_material_file(context.key_path, false, false, context.owner);
     SharedKey key(PEM_read_PrivateKey(file.get(), nullptr, [](char*, int, int, void*) { return 0; }, nullptr), EVP_PKEY_free);
     require(key && X509_check_private_key(context.certificate.get(), key.get()) == 1,
         ERROR_INVALID_DATA, "Invalid or mismatched PKCS#8 private-key object");
@@ -1113,6 +1120,29 @@ Bytes encode_x509(X509* certificate) {
     Bytes result(static_cast<std::size_t>(length));
     auto* cursor = result.data();
     require(i2d_X509(certificate, &cursor) == length, ERROR_INVALID_DATA, "Cannot encode certificate");
+    return result;
+}
+std::recursive_mutex& api_gate() noexcept { return api_mutex; }
+void report_api_failure(DWORD code, const char* message) noexcept { report(code, message); }
+std::filesystem::path current_user_store_directory() { return user_data_directory(); }
+std::vector<Bytes> read_user_store_certificates(
+    const std::filesystem::path& directory, uid_t owner) {
+    std::vector<Bytes> result;
+    for (const auto* name : {"MY", "CA", "ROOT"}) {
+        Store store;
+        store.name = name;
+        store.location = CERT_SYSTEM_STORE_CURRENT_USER;
+        store.readonly = true;
+        store.owner = owner;
+        scoped_backing(store, directory, CERT_STORE_READONLY_FLAG);
+        materialize(store);
+        Statement query(store.db->value, "SELECT id FROM certificates ORDER BY id");
+        while (query.step()) {
+            auto certificate = load_context(
+                store, sqlite3_column_int64(query.value, 0));
+            result.push_back(certificate->der);
+        }
+    }
     return result;
 }
 } // namespace scs

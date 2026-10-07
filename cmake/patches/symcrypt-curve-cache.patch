@@ -1,0 +1,42 @@
+diff --git a/inc/symcrypt_internal.h b/inc/symcrypt_internal.h
+index f17b50c..4f0135b 100644
+--- a/inc/symcrypt_internal.h
++++ b/inc/symcrypt_internal.h
+@@ -3228,6 +3228,12 @@ typedef struct _SYMCRYPT_EXTENDED_SAVE_DATA      SYMCRYPT_EXTENDED_SAVE_DATA, *P
+ 
+ #endif
+ 
++// Module teardown only: all users of cached curves must have stopped and freed their keys.
++// This is not synchronized with curve lookup or key operations.
++VOID
++SYMCRYPT_CALL
++SymCryptEcurveCacheUninit( void );
++
+ // Environment forwarding functions.
+ // CPUIDEX is only forwarded on CPUs that have it.
+ #if SYMCRYPT_CPU_AMD64 | SYMCRYPT_CPU_X86
+diff --git a/lib/ec_internal_curves.c b/lib/ec_internal_curves.c
+index 19523e4..aba6adb 100644
+--- a/lib/ec_internal_curves.c
++++ b/lib/ec_internal_curves.c
+@@ -11,6 +11,20 @@
+ 
+ static PCSYMCRYPT_ECURVE rgpCachedCurves[SYMCRYPT_CACHED_ECURVE_ID_COUNT] = { 0 };
+ 
++VOID
++SYMCRYPT_CALL
++SymCryptEcurveCacheUninit( void )
++{
++    for( UINT32 i = 0; i < SYMCRYPT_CACHED_ECURVE_ID_COUNT; ++i )
++    {
++        if( rgpCachedCurves[i] != NULL )
++        {
++            SymCryptEcurveFree( (PSYMCRYPT_ECURVE) rgpCachedCurves[i] );
++            rgpCachedCurves[i] = NULL;
++        }
++    }
++}
++
+ static
+ PCSYMCRYPT_ECURVE_PARAMS
+ SYMCRYPT_CALL

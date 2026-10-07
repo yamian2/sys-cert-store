@@ -1,22 +1,35 @@
 #include <sys-cert-store/sys-cert-store.h>
+#include "crypto.h"
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/pkcs7.h>
 #include <openssl/pkcs12.h>
+#include <openssl/provider.h>
+#include <openssl/rand.h>
 #include <openssl/x509v3.h>
 #include <sqlite3.h>
 #include <array>
 #include <atomic>
+#include <arpa/inet.h>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
 #include <grp.h>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <netinet/in.h>
+#include <pwd.h>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
@@ -62,6 +75,21 @@ struct PrivateUmask {
     mode_t previous = umask(0077);
     ~PrivateUmask() { umask(previous); }
 };
+struct EnvironmentVariable {
+    std::string name;
+    std::string previous;
+    bool existed;
+    EnvironmentVariable(const char* variable, const std::string& value) : name(variable) {
+        const char* current = std::getenv(variable);
+        existed = current != nullptr;
+        if (current) previous = current;
+        CHECK(setenv(variable, value.c_str(), 1) == 0);
+    }
+    ~EnvironmentVariable() {
+        if (existed) setenv(name.c_str(), previous.c_str(), 1);
+        else unsetenv(name.c_str());
+    }
+};
 
 void write_file(const std::filesystem::path& path, const std::string& data) {
     std::filesystem::create_directories(path.parent_path());
@@ -78,10 +106,23 @@ std::string read_file(const std::filesystem::path& path) {
 Key key() {
     Key result(EVP_EC_gen("prime256v1"), EVP_PKEY_free);
     CHECK(result);
+    CHECK(std::strcmp(OSSL_PROVIDER_get0_name(EVP_PKEY_get0_provider(result.get())), "symcryptprovider") == 0);
+    return result;
+}
+Key signing_key(const char* algorithm) {
+    if (!algorithm) return key();
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> context(
+        EVP_PKEY_CTX_new_from_name(nullptr, algorithm, nullptr), EVP_PKEY_CTX_free);
+    CHECK(context && EVP_PKEY_keygen_init(context.get()) == 1);
+    EVP_PKEY* generated = nullptr;
+    CHECK(EVP_PKEY_generate(context.get(), &generated) == 1);
+    Key result(generated, EVP_PKEY_free);
+    CHECK(std::strcmp(OSSL_PROVIDER_get0_name(EVP_PKEY_get0_provider(result.get())), "symcryptprovider") == 0);
     return result;
 }
 X509Handle make_x509(EVP_PKEY* subject_key, long serial, const char* name, bool ca,
-    X509* issuer = nullptr, EVP_PKEY* issuer_key = nullptr, long not_before = -60) {
+    X509* issuer = nullptr, EVP_PKEY* issuer_key = nullptr, long not_before = -60,
+    const EVP_MD* digest = EVP_sha256(), const char* crl_url = nullptr) {
     X509Handle result(X509_new(), X509_free);
     CHECK(result);
     CHECK(X509_set_version(result.get(), 2) == 1);
@@ -99,7 +140,14 @@ X509Handle make_x509(EVP_PKEY* subject_key, long serial, const char* name, bool 
         X509V3_EXT_conf_nid(nullptr, &context, NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE"),
         X509_EXTENSION_free);
     CHECK(extension && X509_add_ext(result.get(), extension.get(), -1) == 1);
-    CHECK(X509_sign(result.get(), issuer_key ? issuer_key : subject_key, EVP_sha256()) > 0);
+    if (crl_url) {
+        std::string value = "URI:";
+        value += crl_url;
+        extension.reset(X509V3_EXT_conf_nid(nullptr, &context,
+            NID_crl_distribution_points, value.c_str()));
+        CHECK(extension && X509_add_ext(result.get(), extension.get(), -1) == 1);
+    }
+    CHECK(X509_sign(result.get(), issuer_key ? issuer_key : subject_key, digest) > 0);
     return result;
 }
 Bytes der(X509* certificate) {
@@ -113,6 +161,7 @@ Bytes der(X509* certificate) {
 Bytes pfx_bytes(X509* certificate, EVP_PKEY* private_key) {
     std::unique_ptr<PKCS12, decltype(&PKCS12_free)> pfx(
         PKCS12_create("password", "scope test", private_key, certificate, nullptr, 0, 0, 0, 0, 0), PKCS12_free);
+    if (!pfx) ERR_print_errors_fp(stderr);
     CHECK(pfx);
     int size = i2d_PKCS12(pfx.get(), nullptr);
     CHECK(size > 0);
@@ -128,6 +177,91 @@ std::string pem(X509* certificate) {
     auto size = BIO_get_mem_data(buffer.get(), &pointer);
     return std::string(pointer, static_cast<std::size_t>(size));
 }
+std::vector<BYTE> crl_der(X509_CRL* crl) {
+    int size = i2d_X509_CRL(crl, nullptr);
+    CHECK(size > 0);
+    std::vector<BYTE> result(static_cast<std::size_t>(size));
+    auto* cursor = result.data();
+    CHECK(i2d_X509_CRL(crl, &cursor) == size);
+    return result;
+}
+std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> make_crl(
+    X509* issuer, EVP_PKEY* issuer_key) {
+    std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> result(X509_CRL_new(), X509_CRL_free);
+    CHECK(result && X509_CRL_set_version(result.get(), 1) == 1);
+    CHECK(X509_CRL_set_issuer_name(result.get(), X509_get_subject_name(issuer)) == 1);
+    std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> last(
+        ASN1_TIME_adj(nullptr, std::time(nullptr), 0, -60), ASN1_TIME_free);
+    std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> next(
+        ASN1_TIME_adj(nullptr, std::time(nullptr), 1, 0), ASN1_TIME_free);
+    CHECK(last && next);
+    CHECK(X509_CRL_set1_lastUpdate(result.get(), last.get()) == 1);
+    CHECK(X509_CRL_set1_nextUpdate(result.get(), next.get()) == 1);
+    CHECK(X509_CRL_sign(result.get(), issuer_key, EVP_sha256()) > 0);
+    return result;
+}
+struct HttpServer {
+    int socket = -1;
+    pid_t child = -1;
+    unsigned short port = 0;
+    HttpServer() {
+        socket = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(socket >= 0);
+        int reuse = 1;
+        CHECK(setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(bind(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+        socklen_t size = sizeof(address);
+        CHECK(getsockname(socket, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+        port = ntohs(address.sin_port);
+        CHECK(listen(socket, 1) == 0);
+    }
+    void start(const std::vector<BYTE>& body) {
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            alarm(15);
+            int client = accept4(socket, nullptr, nullptr, SOCK_CLOEXEC);
+            if (client < 0) _exit(1);
+            std::array<char, 4096> request{};
+            if (read(client, request.data(), request.size()) <= 0) _exit(2);
+            std::string header = "HTTP/1.0 200 OK\r\nContent-Type: application/pkix-crl\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+            auto send_all = [&](const void* input, std::size_t length) {
+                auto* cursor = static_cast<const BYTE*>(input);
+                while (length) {
+                    auto written = send(client, cursor, length, MSG_NOSIGNAL);
+                    if (written <= 0) _exit(3);
+                    cursor += written;
+                    length -= static_cast<std::size_t>(written);
+                }
+            };
+            send_all(header.data(), header.size());
+            send_all(body.data(), body.size());
+            close(client);
+            close(socket);
+            _exit(0);
+        }
+        close(socket);
+        socket = -1;
+    }
+    void wait() {
+        if (child <= 0) return;
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        child = -1;
+    }
+    ~HttpServer() {
+        if (socket >= 0) close(socket);
+        if (child > 0) {
+            int status = 0;
+            waitpid(child, &status, 0);
+        }
+    }
+};
 PCCERT_CONTEXT create(const Bytes& encoded) {
     return CertCreateCertificateContext(X509_ASN_ENCODING, encoded.data(), static_cast<DWORD>(encoded.size()));
 }
@@ -887,19 +1021,93 @@ void system_scope_tests() {
     CHECK(SysCertConfigureSystemStores(nullptr));
 }
 
-void certutil_tests(const char* executable) {
+void dotnet_crl_cache_tests() {
+    TempDir temp;
+    auto issuer_key = key();
+    auto leaf_key = key();
+    auto issuer = make_x509(issuer_key.get(), 201, "CRL Cache Root", true);
+    HttpServer server;
+    auto url = "http://127.0.0.1:" + std::to_string(server.port) + "/issuer.crl";
+    auto leaf = make_x509(leaf_key.get(), 202, "CRL Cache Leaf", false,
+        issuer.get(), issuer_key.get(), -60, EVP_sha256(), url.c_str());
+    auto crl = make_crl(issuer.get(), issuer_key.get());
+    server.start(crl_der(crl.get()));
+
+    auto user_store = (temp.path / "user-store").string();
+    auto machine_store = (temp.path / "machine-store").string();
+    auto system = (temp.path / "system").string();
+    write_file(std::filesystem::path(system) / "etc/os-release", "ID=ubuntu\n");
+    write_file(std::filesystem::path(system) / "etc/ssl/certs/ca-certificates.crt",
+        pem(issuer.get()));
+    SYS_CERT_STORE_CONFIGURATION configuration{
+        sizeof(configuration), user_store.c_str(), machine_store.c_str(), system.c_str()};
+    CHECK(SysCertConfigureSystemStores(&configuration));
+    {
+        Store personal(scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER));
+        Certificate context(create(der(leaf.get())));
+        Certificate added(add(personal.value, context.value));
+    }
+
+    auto home = temp.path / "home";
+    std::filesystem::create_directory(home);
+    EnvironmentVariable home_variable("HOME", home.string());
+    EnvironmentVariable no_proxy("no_proxy", "127.0.0.1,localhost");
+    EnvironmentVariable no_proxy_upper("NO_PROXY", "127.0.0.1,localhost");
+    auto* account = getpwuid(geteuid());
+    CHECK(account && account->pw_name);
+    CHECK(SysCertPopulateDotNetCrlCache(account->pw_name));
+    server.wait();
+
+    std::vector<unsigned char> utf16;
+    for (auto byte : url) {
+        utf16.push_back(static_cast<unsigned char>(byte));
+        utf16.push_back(0);
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned digest_size = 0;
+    CHECK(EVP_Digest(utf16.data(), utf16.size(), digest.data(), &digest_size,
+        EVP_sha256(), nullptr) == 1 && digest_size >= 4);
+    std::uint32_t url_hash = static_cast<std::uint32_t>(digest[0]) |
+        (static_cast<std::uint32_t>(digest[1]) << 8) |
+        (static_cast<std::uint32_t>(digest[2]) << 16) |
+        (static_cast<std::uint32_t>(digest[3]) << 24);
+    std::ostringstream filename;
+    filename << std::hex << std::setfill('0') << std::nouppercase
+        << std::setw(8) << (X509_issuer_name_hash(leaf.get()) & 0xffffffffUL)
+        << '.' << std::setw(8) << url_hash << ".crl";
+    auto directory = home / ".dotnet/corefx/cryptography/crls";
+    auto cache_file = directory / filename.str();
+    CHECK(std::filesystem::is_regular_file(cache_file));
+    struct stat status{};
+    CHECK(stat(directory.c_str(), &status) == 0 && (status.st_mode & 0777) == 0700);
+    CHECK(stat(cache_file.c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
+    auto close_file = [](FILE* file) { std::fclose(file); };
+    std::unique_ptr<FILE, decltype(close_file)> input(std::fopen(cache_file.c_str(), "rb"), close_file);
+    CHECK(input);
+    std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> cached(
+        PEM_read_X509_CRL(input.get(), nullptr, nullptr, nullptr), X509_CRL_free);
+    CHECK(cached && X509_CRL_cmp(cached.get(), crl.get()) == 0);
+    CHECK(SysCertConfigureSystemStores(nullptr));
+
+    const char invalid_name[] = {static_cast<char>(0xff), '\0'};
+    CHECK(!SysCertPopulateDotNetCrlCache(invalid_name));
+    CHECK(GetLastError() == E_INVALIDARG);
+}
+
+void certutil_tests(const char* executable, const char* algorithm = nullptr) {
     TempDir temp;
     auto user = (temp.path / "user").string();
     auto machine = (temp.path / "machine").string();
     auto system = (temp.path / "system").string();
     auto log = (temp.path / "command.log").string();
-    auto ca_key = key();
-    auto ca = make_x509(ca_key.get(), 100, "Tool Root", true);
-    auto leaf_key = key();
-    auto leaf = make_x509(leaf_key.get(), 101, "Tool Leaf", false, ca.get(), ca_key.get());
+    const EVP_MD* digest = algorithm ? nullptr : EVP_sha256();
+    auto ca_key = signing_key(algorithm);
+    auto ca = make_x509(ca_key.get(), 100, "Tool Root", true, nullptr, nullptr, -60, digest);
+    auto leaf_key = signing_key(algorithm);
+    auto leaf = make_x509(leaf_key.get(), 101, "Tool Leaf", false, ca.get(), ca_key.get(), -60, digest);
     auto leaf_der = der(leaf.get());
     std::string leaf_binary(leaf_der.begin(), leaf_der.end());
-    auto other = make_x509(leaf_key.get(), 102, "Tool Leaf", false, ca.get(), ca_key.get());
+    auto other = make_x509(leaf_key.get(), 102, "Tool Leaf", false, ca.get(), ca_key.get(), -60, digest);
     auto native_bundle = std::filesystem::path(system) / "etc/ssl/certs/ca-certificates.crt";
     write_file(std::filesystem::path(system) / "etc/os-release", "ID=ubuntu\n");
     write_file(native_bundle, pem(ca.get()));
@@ -1056,8 +1264,8 @@ void certutil_tests(const char* executable) {
     CHECK(chmod(password_file.c_str(), 0644) == 0);
     run({"-user", "-importPFX", pfx_file, "--password-file", password_file}, 1);
     CHECK(chmod(password_file.c_str(), 0600) == 0);
-    auto orphan_key = key();
-    auto orphan = make_x509(orphan_key.get(), 103, "Orphan", false, other.get(), leaf_key.get());
+    auto orphan_key = signing_key(algorithm);
+    auto orphan = make_x509(orphan_key.get(), 103, "Orphan", false, other.get(), leaf_key.get(), -60, digest);
     encoded = pfx_bytes(orphan.get(), orphan_key.get());
     auto orphan_pfx = (temp.path / "orphan.pfx").string();
     write_file(orphan_pfx, std::string(encoded.begin(), encoded.end()));
@@ -1065,7 +1273,7 @@ void certutil_tests(const char* executable) {
     run({"-user", "-exportPFX", "ORPHAN", "index:0", exported_pfx, "-f", "--password-file", password_file}, 1);
     run({"-user", "-exportPFX", "ORPHAN", "index:0", exported_pfx, "NoChain", "-f", "--password-file", password_file});
 
-    auto extra_root = make_x509(ca_key.get(), 104, "Extra Root", true);
+    auto extra_root = make_x509(ca_key.get(), 104, "Extra Root", true, nullptr, nullptr, -60, digest);
     auto extra_file = (temp.path / "extra.pem").string();
     write_file(extra_file, pem(extra_root.get()));
     auto anchors = std::filesystem::path(system) / "usr/local/share/ca-certificates";
@@ -1081,13 +1289,165 @@ void certutil_tests(const char* executable) {
     for (const auto& entry : std::filesystem::directory_iterator(temp.path))
         CHECK(!entry.path().filename().string().starts_with(".certutil-"));
 }
+
+void pqc_tests() {
+    CHECK(OPENSSL_VERSION_MAJOR == 3 && OPENSSL_VERSION_MINOR >= 5);
+    CHECK(std::strcmp(OpenSSL_version(OPENSSL_VERSION), OPENSSL_VERSION_TEXT) == 0);
+    CHECK(!OSSL_PROVIDER_available(nullptr, "composite"));
+    std::unique_ptr<EVP_MD, decltype(&EVP_MD_free)> digest(
+        EVP_MD_fetch(nullptr, "SHA256", nullptr), EVP_MD_free);
+    CHECK(digest && std::strcmp(OSSL_PROVIDER_get0_name(EVP_MD_get0_provider(digest.get())), "symcryptprovider") == 0);
+    std::unique_ptr<EVP_CIPHER, decltype(&EVP_CIPHER_free)> cipher(
+        EVP_CIPHER_fetch(nullptr, "AES-256-CBC", nullptr), EVP_CIPHER_free);
+    CHECK(cipher && std::strcmp(OSSL_PROVIDER_get0_name(EVP_CIPHER_get0_provider(cipher.get())), "symcryptprovider") == 0);
+    auto* random = RAND_get0_private(nullptr);
+    CHECK(random && std::strcmp(OSSL_PROVIDER_get0_name(
+        EVP_RAND_get0_provider(EVP_RAND_CTX_get0_rand(random))), "symcryptprovider") == 0);
+    std::unique_ptr<EVP_MD, decltype(&EVP_MD_free)> fips_digest(
+        EVP_MD_fetch(nullptr, "SHA256", "provider=symcryptprovider,fips=yes"), EVP_MD_free);
+    CHECK(!fips_digest);
+    ERR_clear_error();
+    for (const char* unsupported : {"MLDSA65-ECDSA-brainpoolP256r1-SHA512",
+            "MLDSA87-ECDSA-brainpoolP384r1-SHA512", "MLDSA87-ECDSA-P521-SHA512",
+            "1.3.6.1.5.5.7.6.47", "1.3.6.1.5.5.7.6.50", "1.3.6.1.5.5.7.6.54"}) {
+        std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> context(
+            EVP_PKEY_CTX_new_from_name(nullptr, unsupported, nullptr), EVP_PKEY_CTX_free);
+        CHECK(!context);
+        ERR_clear_error();
+    }
+    struct Algorithm { const char* name; const char* oid; };
+    const Algorithm algorithms[] = {
+        {"ML-DSA-44", "2.16.840.1.101.3.4.3.17"},
+        {"ML-DSA-65", "2.16.840.1.101.3.4.3.18"},
+        {"ML-DSA-87", "2.16.840.1.101.3.4.3.19"},
+        {"MLDSA44-ECDSA-P256-SHA256", "1.3.6.1.5.5.7.6.40"},
+        {"MLDSA65-ECDSA-P256-SHA512", "1.3.6.1.5.5.7.6.45"},
+        {"MLDSA65-ECDSA-P384-SHA512", "1.3.6.1.5.5.7.6.46"},
+        {"MLDSA87-ECDSA-P384-SHA512", "1.3.6.1.5.5.7.6.49"},
+    };
+    for (const auto& algorithm : algorithms) {
+        std::cout << "PQC: " << algorithm.name << std::endl;
+        TempDir temp;
+        auto issuer_key = signing_key(algorithm.name);
+        auto subject_key = signing_key(algorithm.name);
+        auto root = make_x509(issuer_key.get(), 1, "PQC Root", true, nullptr, nullptr, -60, nullptr);
+        auto leaf = make_x509(subject_key.get(), 2, "PQC Leaf", false, root.get(), issuer_key.get(), -60, nullptr);
+        CHECK(X509_verify(root.get(), issuer_key.get()) == 1);
+        CHECK(X509_verify(leaf.get(), issuer_key.get()) == 1);
+        CHECK(X509_verify(leaf.get(), subject_key.get()) != 1);
+        ERR_clear_error();
+        auto check_algorithm = [&](const X509_ALGOR* value) {
+            const ASN1_OBJECT* object = nullptr;
+            int parameter_type = 0;
+            X509_ALGOR_get0(&object, &parameter_type, nullptr, value);
+            std::array<char, 100> oid{};
+            CHECK(OBJ_obj2txt(oid.data(), static_cast<int>(oid.size()), object, 1) > 0);
+            CHECK(std::string(oid.data()) == algorithm.oid && parameter_type == V_ASN1_UNDEF);
+        };
+        X509_ALGOR* public_algorithm = nullptr;
+        CHECK(X509_PUBKEY_get0_param(nullptr, nullptr, nullptr, &public_algorithm, X509_get_X509_PUBKEY(leaf.get())) == 1);
+        check_algorithm(public_algorithm);
+        check_algorithm(X509_get0_tbs_sigalg(leaf.get()));
+        const ASN1_BIT_STRING* signature = nullptr;
+        const X509_ALGOR* outer_algorithm = nullptr;
+        X509_get0_signature(&signature, &outer_algorithm, leaf.get());
+        check_algorithm(outer_algorithm);
+        CHECK(signature && ASN1_STRING_length(signature) > 2000);
+
+        Store memory_store(memory());
+        Certificate root_context(create(der(root.get())));
+        Certificate added_root(add(memory_store.value, root_context.value));
+        auto leaf_der = der(leaf.get());
+        Certificate leaf_context(create(leaf_der));
+        DWORD flags = CERT_STORE_SIGNATURE_FLAG;
+        Certificate issuer(CertGetIssuerCertificateFromStore(memory_store.value, leaf_context.value, nullptr, &flags));
+        CHECK(flags == 0);
+        // Composite signatures concatenate ML-DSA then ECDSA. Corrupt both ends
+        // independently to ensure verification requires both components.
+        auto signature_size = static_cast<std::size_t>(ASN1_STRING_length(signature));
+        for (auto offset : {leaf_der.size() - signature_size, leaf_der.size() - 1}) {
+            auto corrupt = leaf_der;
+            corrupt[offset] ^= 1;
+            const BYTE* cursor = corrupt.data();
+            X509Handle broken(d2i_X509(nullptr, &cursor, static_cast<long>(corrupt.size())), X509_free);
+            CHECK(broken && X509_verify(broken.get(), issuer_key.get()) != 1);
+            ERR_clear_error();
+            Certificate broken_context(create(corrupt));
+            flags = CERT_STORE_SIGNATURE_FLAG;
+            Certificate found(CertGetIssuerCertificateFromStore(memory_store.value, broken_context.value, nullptr, &flags));
+            CHECK(flags == CERT_STORE_SIGNATURE_FLAG);
+        }
+        auto encoded_pfx = pfx_bytes(leaf.get(), subject_key.get());
+        CRYPT_DATA_BLOB blob{static_cast<DWORD>(encoded_pfx.size()), encoded_pfx.data()};
+        auto database = (temp.path / "PQC.db").string();
+        {
+            Store persistent(CertOpenStore(SYS_CERT_STORE_PROV_SQLITE, 0, 0, 0, database.c_str()));
+            CHECK(SysCertImportPfxToStore(persistent.value, &blob, L"password", 0));
+        }
+        Store reopened(CertOpenStore(SYS_CERT_STORE_PROV_SQLITE, 0, 0, CERT_STORE_OPEN_EXISTING_FLAG, database.c_str()));
+        Certificate stored(CertEnumCertificatesInStore(reopened.value, nullptr));
+        CHECK(std::strcmp(stored.value->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId, algorithm.oid) == 0);
+        CHECK(Bytes(stored.value->pbCertEncoded, stored.value->pbCertEncoded + stored.value->cbCertEncoded) == leaf_der);
+        CHECK(read_file(material_path(stored.value)) == pem(leaf.get()));
+        auto private_path = material_path(stored.value, TRUE);
+        auto close_file = [](FILE* file) { std::fclose(file); };
+        std::unique_ptr<FILE, decltype(close_file)> input(std::fopen(private_path.c_str(), "rb"), close_file);
+        CHECK(input);
+        Key recovered(PEM_read_PrivateKey(input.get(), nullptr, nullptr, nullptr), EVP_PKEY_free);
+        CHECK(recovered && EVP_PKEY_eq(recovered.get(), subject_key.get()) == 1);
+        CHECK(std::strcmp(OSSL_PROVIDER_get0_name(EVP_PKEY_get0_provider(recovered.get())), "symcryptprovider") == 0);
+        auto signed_again = make_x509(recovered.get(), 3, "Reloaded PQC", true, nullptr, nullptr, -60, nullptr);
+        CHECK(X509_verify(signed_again.get(), subject_key.get()) == 1);
+        CHECK(CertDeleteCertificateFromStore(CertDuplicateCertificateContext(stored.value)));
+        CHECK(!std::filesystem::exists(private_path) && enumerate(reopened.value) == 0);
+    }
+}
+void interop_tests(const char* directory) {
+    for (const char* name : {"MLDSA44-ECDSA-P256-SHA256", "MLDSA65-ECDSA-P256-SHA512",
+            "MLDSA65-ECDSA-P384-SHA512", "MLDSA87-ECDSA-P384-SHA512"}) {
+        auto path = std::filesystem::path(directory) / name;
+        auto public_bytes = read_file(path / "public.der");
+        const BYTE* cursor = reinterpret_cast<const BYTE*>(public_bytes.data());
+        Key public_key(d2i_PUBKEY(nullptr, &cursor, static_cast<long>(public_bytes.size())), EVP_PKEY_free);
+        CHECK(public_key && cursor == reinterpret_cast<const BYTE*>(public_bytes.data()) + public_bytes.size());
+        auto private_bytes = read_file(path / "private.der");
+        cursor = reinterpret_cast<const BYTE*>(private_bytes.data());
+        std::unique_ptr<PKCS8_PRIV_KEY_INFO, decltype(&PKCS8_PRIV_KEY_INFO_free)> info(
+            d2i_PKCS8_PRIV_KEY_INFO(nullptr, &cursor, static_cast<long>(private_bytes.size())), PKCS8_PRIV_KEY_INFO_free);
+        CHECK(info && cursor == reinterpret_cast<const BYTE*>(private_bytes.data()) + private_bytes.size());
+        Key private_key(EVP_PKCS82PKEY(info.get()), EVP_PKEY_free);
+        OPENSSL_cleanse(private_bytes.data(), private_bytes.size());
+        CHECK(private_key && EVP_PKEY_eq(private_key.get(), public_key.get()) == 1);
+        auto message = read_file(path / "message.bin");
+        auto signature = read_file(path / "signature.bin");
+        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        CHECK(context && EVP_DigestVerifyInit(context.get(), nullptr, nullptr, nullptr, public_key.get()) == 1);
+        CHECK(EVP_DigestVerifyUpdate(context.get(), message.data(), message.size()) == 1);
+        CHECK(EVP_DigestVerifyFinal(context.get(), reinterpret_cast<const BYTE*>(signature.data()), signature.size()) == 1);
+        auto certificate = make_x509(private_key.get(), 1, "Composite interoperability", true, nullptr, nullptr, -60, nullptr);
+        auto encoded = der(certificate.get());
+        Certificate parsed(create(encoded));
+        CHECK(parsed.value->cbCertEncoded == encoded.size());
+        write_file(path / "certificate.der", std::string(encoded.begin(), encoded.end()));
+        std::cout << "interop: " << name << '\n';
+    }
+}
 }
 
 int main(int argc, char** argv) {
     try {
+        scs::initialize_crypto();
+        if (argc == 3 && std::string(argv[1]) == "--interop") {
+            interop_tests(argv[2]);
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--pqc") {
+            pqc_tests();
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--child-read") return child_read(argv[2]);
-        if (argc == 3 && std::string(argv[1]) == "--certutil") {
-            certutil_tests(argv[2]);
+        if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--certutil") {
+            certutil_tests(argv[2], argc == 4 ? argv[3] : nullptr);
             std::cout << "All certutil tests passed\n";
             return 0;
         }
@@ -1100,10 +1460,12 @@ int main(int argc, char** argv) {
         error_tests();
         thread_tests();
         system_scope_tests();
+        dotnet_crl_cache_tests();
         std::cout << "All certificate-store tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        ERR_print_errors_fp(stderr);
         return 1;
     }
 }

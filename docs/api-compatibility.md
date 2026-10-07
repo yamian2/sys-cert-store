@@ -27,7 +27,10 @@ Supported means the subset described here, not full Windows equivalence.
 `GetLastError`, `SetLastError`, `SysCertGetLastErrorMessage` and
 `SysCertUpdateTrustAnchor`, `SysCertImportPfxToStore`, and
 `SysCertGetCertificateFilePath`, `SysCertGetCertificateStoreLocation`, and
-`SysCertConfigureSystemStores` complete the error/native/file/scope integration surface.
+`SysCertConfigureSystemStores` complete the error/native/file/scope integration
+surface. `SysCertPopulateDotNetCrlCache` is a Linux-specific extension that
+preloads .NET's private CRL cache from user or computer certificate-store CDPs;
+it is not a Crypt32 API.
 
 ### Detailed compatibility limits
 
@@ -149,8 +152,10 @@ Ubuntu 24.04 WSL is the initial exercised environment. The CI workflow also
 targets Red Hat UBI 9 and Azure Linux 3 containers. These jobs establish
 compiler/library compatibility; the isolated layout tests are not a substitute
 for privileged native-update integration on those distros. Older CBL-Mariner
-with OpenSSL 1.1 is not supported by the current OpenSSL 3 baseline. Do not infer
-Windows behavioral conformance from passing Linux tests alone.
+now uses the bundled OpenSSL rather than its OS crypto version, but older
+CBL-Mariner toolchains have not been validated. Do not infer Windows behavioral
+conformance from passing Linux tests alone. See [PQC support](pqc-support.md)
+for standard-OID ML-DSA and composite coverage.
 
 ## References
 

@@ -35,4 +35,8 @@ BOOL SysCertImportPfxToStore(HCERTSTORE store, const CRYPT_DATA_BLOB* pfx,
 // Returns a UTF-8 path (including the NUL terminator in the size query).
 BOOL SysCertGetCertificateFilePath(PCCERT_CONTEXT certificate, BOOL privateKey,
     char* path, DWORD* size) noexcept;
+// Preloads the .NET Linux CRL cache from MY, CA, and ROOT certificate CDPs.
+// userName is a UTF-8 Linux account name. nullptr targets users with running
+// CoreCLR processes and uses the computer stores as the certificate source.
+BOOL SysCertPopulateDotNetCrlCache(LPCSTR userName) noexcept;
 }

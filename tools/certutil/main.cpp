@@ -1,4 +1,5 @@
 #include <sys-cert-store/sys-cert-store.h>
+#include "crypto.h"
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
@@ -668,6 +669,7 @@ int main(int argc, char** argv) {
     try {
         auto options = parse_options(argc, argv);
         if (options.help) { std::cout << help; return std::cout ? 0 : 1; }
+        scs::initialize_crypto();
         execute(std::move(options));
         return 0;
     } catch (const UsageError& error) {

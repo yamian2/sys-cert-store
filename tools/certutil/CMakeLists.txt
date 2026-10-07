@@ -1,5 +1,6 @@
 add_executable(certutil main.cpp)
-target_link_libraries(certutil PRIVATE sys-cert-store OpenSSL::Crypto)
+target_link_libraries(certutil PRIVATE sys-cert-store scs-crypto)
+target_link_options(certutil PRIVATE "LINKER:--exclude-libs,ALL")
 target_compile_options(certutil PRIVATE -Wall -Wextra -Wpedantic -Werror)
 file(RELATIVE_PATH certutil_library_path "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
 set_target_properties(certutil PROPERTIES INSTALL_RPATH "$ORIGIN/${certutil_library_path}")

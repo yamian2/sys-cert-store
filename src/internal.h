@@ -3,8 +3,10 @@
 #include <openssl/x509.h>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
 namespace scs {
@@ -30,4 +32,9 @@ std::vector<Bytes> read_native(const NativeLayout& layout);
 void update_anchor(X509* certificate, bool install, const NativeLayout& layout);
 void remove_trusted_certificate(X509* certificate, const NativeLayout& layout);
 Bytes encode_x509(X509* certificate);
+std::recursive_mutex& api_gate() noexcept;
+void report_api_failure(DWORD code, const char* message) noexcept;
+std::filesystem::path current_user_store_directory();
+std::vector<Bytes> read_user_store_certificates(
+    const std::filesystem::path& directory, uid_t owner);
 }

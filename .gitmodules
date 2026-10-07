@@ -1,0 +1,9 @@
+[submodule "third_party/openssl"]
+	path = third_party/openssl
+	url = https://github.com/openssl/openssl.git
+[submodule "third_party/scossl"]
+	path = third_party/scossl
+	url = https://github.com/microsoft/SymCrypt-OpenSSL.git
+[submodule "third_party/symcrypt"]
+	path = third_party/symcrypt
+	url = https://github.com/microsoft/SymCrypt.git

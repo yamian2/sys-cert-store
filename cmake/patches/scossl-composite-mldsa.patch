@@ -1,0 +1,1276 @@
+diff --git a/SymCryptProvider/src/keymgmt/p_scossl_ecc_keymgmt.c b/SymCryptProvider/src/keymgmt/p_scossl_ecc_keymgmt.c
+--- a/SymCryptProvider/src/keymgmt/p_scossl_ecc_keymgmt.c
++++ b/SymCryptProvider/src/keymgmt/p_scossl_ecc_keymgmt.c
+@@ -847,8 +847,8 @@
+             goto cleanup;
+         }
+ 
+-        ret = (memcmp(pbPrivateKey1, pbPrivateKey2, cbPrivateKey) == 0) &&
+-              (memcmp(pbPublicKey1, pbPublicKey2, cbPublicKey) == 0);
++        ret = (cbPrivateKey == 0 || CRYPTO_memcmp(pbPrivateKey1, pbPrivateKey2, cbPrivateKey) == 0) &&
++              (cbPublicKey == 0 || memcmp(pbPublicKey1, pbPublicKey2, cbPublicKey) == 0);
+     }
+     else
+     {
+diff --git a/SymCryptProvider/CMakeLists.txt b/SymCryptProvider/CMakeLists.txt
+index b7fe965..f39c688 100644
+--- a/SymCryptProvider/CMakeLists.txt
++++ b/SymCryptProvider/CMakeLists.txt
+@@ -24,12 +24,14 @@ set(SCOSSL_SOURCES
+     ./src/decoder/p_scossl_decode_common.c
+     ./src/decoder/p_scossl_decode_mlkem.c
+     ./src/decoder/p_scossl_decode_mldsa.c
++    ./src/decoder/p_scossl_decode_composite_mldsa.c
+     ./src/digests/p_scossl_digest_common.c
+     ./src/digests/p_scossl_digest_generic.c
+     ./src/digests/p_scossl_shake.c
+     ./src/digests/p_scossl_cshake.c
+     ./src/encoder/p_scossl_encode_common.c
+     ./src/encoder/p_scossl_encode_mldsa.c
++    ./src/encoder/p_scossl_encode_composite_mldsa.c
+     ./src/encoder/p_scossl_encode_mlkem.c
+     ./src/kdf/p_scossl_hkdf.c
+     ./src/kdf/p_scossl_kbkdf.c
+@@ -47,6 +49,7 @@ set(SCOSSL_SOURCES
+     ./src/keymgmt/p_scossl_ecc_keymgmt.c
+     ./src/keymgmt/p_scossl_kdf_keymgmt.c
+     ./src/keymgmt/p_scossl_mldsa_keymgmt.c
++    ./src/keymgmt/p_scossl_composite_mldsa_keymgmt.c
+     ./src/keymgmt/p_scossl_mlkem_keymgmt.c
+     ./src/keymgmt/p_scossl_mlkem_hybrid_keymgmt.c
+     ./src/keymgmt/p_scossl_rsa_keymgmt.c
+@@ -56,6 +59,7 @@ set(SCOSSL_SOURCES
+     ./src/signature/p_scossl_ecdsa_signature.c
+     ./src/signature/p_scossl_ecdsa_sigalg_signature.c
+     ./src/signature/p_scossl_mldsa.c
++    ./src/signature/p_scossl_composite_mldsa.c
+     ./src/signature/p_scossl_rsa_signature.c
+     ./src/signature/p_scossl_rsa_sigalg_signature.c
+     ./src/skeymgmt/p_scossl_aes_skeymgmt.c
+@@ -109,3 +113,7 @@ install(
+     TARGETS scossl_provider
+     LIBRARY DESTINATION "${OPENSSL_PROVIDERS}"
+     PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
++
++if(BUILD_TESTING)
++    add_subdirectory(${CMAKE_SOURCE_DIR}/test/CompositeMlDsa ${CMAKE_CURRENT_BINARY_DIR}/test)
++endif()
+diff --git a/SymCryptProvider/README.md b/SymCryptProvider/README.md
+index 1be0c39..4702bb9 100644
+--- a/SymCryptProvider/README.md
++++ b/SymCryptProvider/README.md
+@@ -73,6 +73,52 @@ Note that just because an algorithm is FIPS certifiable, does not mean it is rec
+     - PKCS1, PSS
+ - ECDSA (Named curves only)
+     - P-192, P-224, P-256, P-384, P-521
++- Composite ML-DSA/ECDSA (the four combinations below)
++
++### Composite ML-DSA
++
++Requires OpenSSL 3.5 or newer and SymCrypt 103.12 or newer.
++
++| Algorithm | OID |
++| --- | --- |
++| MLDSA44-ECDSA-P256-SHA256 | 1.3.6.1.5.5.7.6.40 |
++| MLDSA65-ECDSA-P256-SHA512 | 1.3.6.1.5.5.7.6.45 |
++| MLDSA65-ECDSA-P384-SHA512 | 1.3.6.1.5.5.7.6.46 |
++| MLDSA87-ECDSA-P384-SHA512 | 1.3.6.1.5.5.7.6.49 |
++
++The algorithm name, its `id-` alias, and numeric OID can be used for fetching.
++Use `provider=symcryptprovider` when a specific implementation is required.
++These algorithms and their codecs have `fips=no`; they are not available to a
++`fips=yes` fetch. P-521, Brainpool, RSA, and EdDSA composites are not exposed.
++
++SymCrypt implements key generation, component cryptography, domain separation,
++and composite signature assembly. SCOSSL implements the EVP and ASN.1 adapters.
++No separate composite provider is needed. Keys support generation, duplication,
++public/private import and export, matching, and validation through SymCrypt.
++Raw key getters and the `pub`/`priv` import/export parameters use the SymCrypt
++composite key formats, not the raw format of either individual component.
++
++`EVP_PKEY_sign`/`verify` and one-shot or streaming `EVP_DigestSign`/`Verify`
++operate on the message, not a caller-selected digest. Pass a NULL digest name.
++Streaming uses SymCrypt SHA-256 for the first combination and SHA-512 for the
++other three, then passes that message prehash to SymCrypt's composite API.
++The optional `context-string` parameter accepts at most 255 bytes. An external
++digest, deterministic signing, and caller-supplied generation seeds are not
++supported. Signature size queries return the maximum allocation size; the
++returned signature length can be smaller because ECDSA uses DER encoding.
++
++Supported encodings are SPKI public keys and PKCS#8 private keys, in DER or PEM,
++including encrypted PKCS#8 and human-readable key output. Composite
++AlgorithmIdentifier parameters are absent. The PKCS#8 private-key OCTET STRING
++contains SymCrypt's composite private encoding directly, without the additional
++OCTET STRING used by the pure ML-DSA seed format. The default provider supplies
++the outer PEM/encrypted-PKCS#8 decoding pipeline, so load it alongside SCOSSL.
++The normal OpenSSL X.509, CSR, and encrypted PKCS#12 APIs use these adapters.
++
++This is shared-provider support. It does not add TLS signature-scheme
++negotiation or static embedding into another application. See the
++[tests and interoperability instructions](../test/CompositeMlDsa/README.md),
++including the SymCrypt shared-library unload limitation.
+ 
+ ### Asymmetric Cipher
+ - RSA
+diff --git a/SymCryptProvider/src/decoder/p_scossl_decode_composite_mldsa.c b/SymCryptProvider/src/decoder/p_scossl_decode_composite_mldsa.c
+new file mode 100644
+index 0000000..4967b0a
+--- /dev/null
++++ b/SymCryptProvider/src/decoder/p_scossl_decode_composite_mldsa.c
+@@ -0,0 +1,91 @@
++//
++// Copyright (c) Microsoft Corporation. Licensed under the MIT license.
++//
++
++#include "p_scossl_decode_common.h"
++#include "signature/p_scossl_composite_mldsa.h"
++#include <openssl/proverr.h>
++
++static SCOSSL_COMPOSITE_MLDSA_KEY *composite_decode(
++    SCOSSL_DECODE_CTX *ctx, BIO *bio, SYMCRYPT_COMPOSITE_MLDSA_PARAMS params, BOOL privateKey)
++{
++    const SCOSSL_COMPOSITE_MLDSA_ALG *alg = p_scossl_composite_mldsa_alg(params);
++    SCOSSL_COMPOSITE_MLDSA_KEY *key = NULL;
++    PKCS8_PRIV_KEY_INFO *info = NULL;
++    SUBJECT_PUBKEY_INFO *spki = NULL;
++    const X509_ALGOR *algor = NULL;
++    const ASN1_OBJECT *oid = NULL;
++    const unsigned char *bytes = NULL;
++    int length = 0, parameterType;
++    if (privateKey)
++    {
++        info = d2i_PKCS8_PRIV_KEY_INFO_bio(bio, NULL);
++        if (info == NULL || !PKCS8_pkey_get0(&oid, &bytes, &length, &algor, info))
++            goto cleanup;
++    }
++    else
++    {
++        spki = (SUBJECT_PUBKEY_INFO *)ASN1_item_d2i_bio_ex(
++            p_scossl_decode_subject_pubkey_asn1_item(), bio, NULL, ctx->provctx->libctx, NULL);
++        if (spki == NULL)
++            goto cleanup;
++        algor = spki->x509Alg;
++        X509_ALGOR_get0(&oid, NULL, NULL, algor);
++        bytes = ASN1_STRING_get0_data(spki->subjectPublicKey);
++        length = ASN1_STRING_length(spki->subjectPublicKey);
++    }
++    if (OBJ_obj2nid(oid) != OBJ_txt2nid(alg->oid))
++        goto cleanup; // Another parameter-set decoder may accept this object.
++    X509_ALGOR_get0(NULL, &parameterType, NULL, algor);
++    if (parameterType != V_ASN1_UNDEF || length <= 0 ||
++        (spki != NULL && (spki->subjectPublicKey->flags & 7) != 0))
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_BAD_ENCODING);
++        goto cleanup;
++    }
++    key = p_scossl_composite_mldsa_new(params);
++    if (key != NULL && !p_scossl_composite_mldsa_set_encoded(key, privateKey, bytes, (SIZE_T)length))
++    {
++        p_scossl_composite_mldsa_free(key);
++        key = NULL;
++    }
++cleanup:
++    PKCS8_PRIV_KEY_INFO_free(info);
++    ASN1_item_free((ASN1_VALUE *)spki, p_scossl_decode_subject_pubkey_asn1_item());
++    return key;
++}
++
++static int composite_export_object(ossl_unused void *ctx, const void *reference,
++    size_t length, OSSL_CALLBACK *cb, void *arg)
++{
++    SCOSSL_COMPOSITE_MLDSA_KEY *key;
++    if (length != sizeof(key) || reference == NULL || (key = *(SCOSSL_COMPOSITE_MLDSA_KEY **)reference) == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_PASSED_INVALID_ARGUMENT);
++        return SCOSSL_FAILURE;
++    }
++    return p_scossl_composite_mldsa_export(key, key->hasPrivate ?
++        OSSL_KEYMGMT_SELECT_KEYPAIR : OSSL_KEYMGMT_SELECT_PUBLIC_KEY, cb, arg);
++}
++
++#define DECODE_VARIANT_TYPE(id, sym, name, type, privateKey) \
++    static void *id##_##type##_decode(SCOSSL_DECODE_CTX *ctx, BIO *bio) \
++    { return composite_decode(ctx, bio, SYMCRYPT_COMPOSITE_MLDSA_PARAMS_##sym, privateKey); } \
++    static const SCOSSL_DECODE_KEYTYPE_DESC id##_##type##_desc = { \
++        name, select_##type, (PSCOSSL_DECODE_INTERNAL_FN)id##_##type##_decode, \
++        (OSSL_FUNC_keymgmt_free_fn *)p_scossl_composite_mldsa_free}; \
++    static void *id##_##type##_new(SCOSSL_PROVCTX *provctx) \
++    { return p_scossl_decode_newctx(provctx, &id##_##type##_desc); } \
++    static int id##_##type##_selection(ossl_unused void *provctx, int selection) \
++    { return p_scossl_decode_does_selection(&id##_##type##_desc, selection); } \
++    const OSSL_DISPATCH p_scossl_der_to_##id##_##type##_functions[] = { \
++        {OSSL_FUNC_DECODER_NEWCTX, (void (*)(void))id##_##type##_new}, \
++        {OSSL_FUNC_DECODER_FREECTX, (void (*)(void))p_scossl_decode_freectx}, \
++        {OSSL_FUNC_DECODER_DOES_SELECTION, (void (*)(void))id##_##type##_selection}, \
++        {OSSL_FUNC_DECODER_DECODE, (void (*)(void))p_scossl_decode}, \
++        {OSSL_FUNC_DECODER_EXPORT_OBJECT, (void (*)(void))composite_export_object}, \
++        {0, NULL}};
++#define DECODE_VARIANT(id, sym, name, oid, bits) \
++    DECODE_VARIANT_TYPE(id, sym, name, PrivateKeyInfo, TRUE) \
++    DECODE_VARIANT_TYPE(id, sym, name, SubjectPublicKeyInfo, FALSE)
++SCOSSL_COMPOSITE_MLDSA_VARIANTS(DECODE_VARIANT)
+diff --git a/SymCryptProvider/src/encoder/p_scossl_encode_common.c b/SymCryptProvider/src/encoder/p_scossl_encode_common.c
+index 23a256e..c624595 100644
+--- a/SymCryptProvider/src/encoder/p_scossl_encode_common.c
++++ b/SymCryptProvider/src/encoder/p_scossl_encode_common.c
+@@ -38,6 +38,7 @@ void p_scossl_encode_freectx(SCOSSL_ENCODE_CTX *ctx)
+     if (ctx == NULL)
+         return;
+ 
++    EVP_CIPHER_free(ctx->cipher);
+     OPENSSL_free(ctx);
+ }
+ 
+diff --git a/SymCryptProvider/src/encoder/p_scossl_encode_composite_mldsa.c b/SymCryptProvider/src/encoder/p_scossl_encode_composite_mldsa.c
+new file mode 100644
+index 0000000..b74caf7
+--- /dev/null
++++ b/SymCryptProvider/src/encoder/p_scossl_encode_composite_mldsa.c
+@@ -0,0 +1,184 @@
++//
++// Copyright (c) Microsoft Corporation. Licensed under the MIT license.
++//
++
++#include "p_scossl_encode_common.h"
++#include "signature/p_scossl_composite_mldsa.h"
++#include <openssl/pkcs12.h>
++#include <openssl/proverr.h>
++
++static PKCS8_PRIV_KEY_INFO *composite_private_info(const SCOSSL_COMPOSITE_MLDSA_KEY *key)
++{
++    PBYTE bytes = NULL, owned = NULL;
++    SIZE_T length = 0;
++    ASN1_OBJECT *oid = NULL;
++    PKCS8_PRIV_KEY_INFO *info = NULL;
++    if (!p_scossl_composite_mldsa_get_encoded(key, TRUE, &bytes, &length))
++        return NULL;
++    oid = OBJ_txt2obj(key->alg->oid, 1);
++    owned = OPENSSL_memdup(bytes, length);
++    info = PKCS8_PRIV_KEY_INFO_new();
++    if (oid == NULL || owned == NULL || info == NULL ||
++        !PKCS8_pkey_set0(info, oid, 0, V_ASN1_UNDEF, NULL, owned, (int)length))
++    {
++        ERR_raise(ERR_LIB_PROV, ASN1_R_ENCODE_ERROR);
++        PKCS8_PRIV_KEY_INFO_free(info);
++        info = NULL;
++        ASN1_OBJECT_free(oid);
++        OPENSSL_clear_free(owned, length);
++    }
++    OPENSSL_secure_clear_free(bytes, length);
++    return info;
++}
++
++static int composite_private_encode(SCOSSL_ENCODE_CTX *ctx, BIO *out,
++    const SCOSSL_COMPOSITE_MLDSA_KEY *key, ossl_unused int selection,
++    OSSL_PASSPHRASE_CALLBACK *cb, void *arg)
++{
++    PKCS8_PRIV_KEY_INFO *info = composite_private_info(key);
++    X509_SIG *encrypted = NULL;
++    char password[PEM_BUFSIZE];
++    SIZE_T passwordLength = 0;
++    int ret = 0;
++    if (info == NULL)
++        return SCOSSL_FAILURE;
++    if (ctx->cipher != NULL)
++    {
++        if (cb == NULL || !cb(password, sizeof(password), &passwordLength, NULL, arg) ||
++            passwordLength > sizeof(password))
++        {
++            ERR_raise(ERR_LIB_PROV, PROV_R_UNABLE_TO_GET_PASSPHRASE);
++            goto cleanup;
++        }
++        encrypted = PKCS8_encrypt_ex(-1, ctx->cipher, password, (int)passwordLength,
++            NULL, 0, 0, info, ctx->provctx->libctx, NULL);
++        if (encrypted == NULL)
++            goto cleanup;
++        ret = ctx->desc->outFormat == SCOSSL_ENCODE_PEM ?
++            PEM_write_bio_PKCS8(out, encrypted) : i2d_PKCS8_bio(out, encrypted);
++    }
++    else
++    {
++        ret = ctx->desc->outFormat == SCOSSL_ENCODE_PEM ?
++            PEM_write_bio_PKCS8_PRIV_KEY_INFO(out, info) : i2d_PKCS8_PRIV_KEY_INFO_bio(out, info);
++    }
++cleanup:
++    if (!ret)
++        ERR_raise(ERR_LIB_PROV, ASN1_R_ENCODE_ERROR);
++    OPENSSL_cleanse(password, sizeof(password));
++    X509_SIG_free(encrypted);
++    PKCS8_PRIV_KEY_INFO_free(info);
++    return ret;
++}
++
++static int composite_encrypted_encode(SCOSSL_ENCODE_CTX *ctx, BIO *out,
++    const SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection, OSSL_PASSPHRASE_CALLBACK *cb, void *arg)
++{
++    if (ctx->cipher == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_CIPHER);
++        return SCOSSL_FAILURE;
++    }
++    return composite_private_encode(ctx, out, key, selection, cb, arg);
++}
++
++static int composite_public_encode(SCOSSL_ENCODE_CTX *ctx, BIO *out,
++    const SCOSSL_COMPOSITE_MLDSA_KEY *key, ossl_unused int selection,
++    ossl_unused OSSL_PASSPHRASE_CALLBACK *cb, ossl_unused void *arg)
++{
++    PBYTE bytes = NULL, owned = NULL;
++    SIZE_T length = 0;
++    X509_PUBKEY *info = NULL;
++    ASN1_OBJECT *oid = NULL;
++    int ret = 0;
++    if (!p_scossl_composite_mldsa_get_encoded(key, FALSE, &bytes, &length))
++        return SCOSSL_FAILURE;
++    info = X509_PUBKEY_new();
++    oid = OBJ_txt2obj(key->alg->oid, 1);
++    owned = OPENSSL_memdup(bytes, length);
++    if (info == NULL || oid == NULL || owned == NULL ||
++        !X509_PUBKEY_set0_param(info, oid, V_ASN1_UNDEF, NULL, owned, (int)length))
++        goto cleanup;
++    oid = NULL;
++    owned = NULL;
++    ret = ctx->desc->outFormat == SCOSSL_ENCODE_PEM ?
++        PEM_write_bio_X509_PUBKEY(out, info) : i2d_X509_PUBKEY_bio(out, info);
++cleanup:
++    if (!ret)
++        ERR_raise(ERR_LIB_PROV, ASN1_R_ENCODE_ERROR);
++    OPENSSL_secure_clear_free(bytes, length);
++    OPENSSL_free(owned);
++    ASN1_OBJECT_free(oid);
++    X509_PUBKEY_free(info);
++    return ret;
++}
++
++static int composite_text_encode(ossl_unused SCOSSL_ENCODE_CTX *ctx, BIO *out,
++    const SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection,
++    ossl_unused OSSL_PASSPHRASE_CALLBACK *cb, ossl_unused void *arg)
++{
++    PBYTE bytes = NULL;
++    SIZE_T length = 0;
++    BOOL privateKey = (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0;
++    int ret = 0;
++    if (!p_scossl_composite_mldsa_get_encoded(key, privateKey, &bytes, &length))
++        return SCOSSL_FAILURE;
++    if (BIO_printf(out, "%s %s key:\n", key->alg->name, privateKey ? "Private" : "Public") > 0)
++        ret = p_scossl_encode_write_key_bytes(bytes, length, out);
++    if (!ret)
++        ERR_raise(ERR_LIB_PROV, ERR_R_OPERATION_FAIL);
++    OPENSSL_secure_clear_free(bytes, length);
++    return ret;
++}
++
++#define ENCODE_DESCRIPTOR(type, format, selection, fn) \
++    static const SCOSSL_ENCODE_KEYTYPE_DESC desc_##type##_##format = { \
++        selection, SCOSSL_ENCODE_##format, (PSCOSSL_ENCODE_INTERNAL_FN)fn}; \
++    static void *new_##type##_##format(SCOSSL_PROVCTX *provctx) \
++    { return p_scossl_encode_newctx(provctx, &desc_##type##_##format); } \
++    static int select_##type##_##format(ossl_unused void *provctx, int selectionValue) \
++    { return p_scossl_encode_does_selection(&desc_##type##_##format, selectionValue); }
++
++ENCODE_DESCRIPTOR(PrivateKeyInfo, DER, OSSL_KEYMGMT_SELECT_PRIVATE_KEY, composite_private_encode)
++ENCODE_DESCRIPTOR(PrivateKeyInfo, PEM, OSSL_KEYMGMT_SELECT_PRIVATE_KEY, composite_private_encode)
++ENCODE_DESCRIPTOR(EncryptedPrivateKeyInfo, DER, OSSL_KEYMGMT_SELECT_PRIVATE_KEY, composite_encrypted_encode)
++ENCODE_DESCRIPTOR(EncryptedPrivateKeyInfo, PEM, OSSL_KEYMGMT_SELECT_PRIVATE_KEY, composite_encrypted_encode)
++ENCODE_DESCRIPTOR(SubjectPublicKeyInfo, DER, OSSL_KEYMGMT_SELECT_PUBLIC_KEY, composite_public_encode)
++ENCODE_DESCRIPTOR(SubjectPublicKeyInfo, PEM, OSSL_KEYMGMT_SELECT_PUBLIC_KEY, composite_public_encode)
++ENCODE_DESCRIPTOR(text, TEXT, OSSL_KEYMGMT_SELECT_KEYPAIR, composite_text_encode)
++
++#define ENCODE_DISPATCH(id, type, suffix, format) \
++    const OSSL_DISPATCH p_scossl_##id##_to_##type##_##suffix##_functions[] = { \
++        {OSSL_FUNC_ENCODER_NEWCTX, (void (*)(void))new_##type##_##format}, \
++        {OSSL_FUNC_ENCODER_FREECTX, (void (*)(void))p_scossl_encode_freectx}, \
++        {OSSL_FUNC_ENCODER_SET_CTX_PARAMS, (void (*)(void))p_scossl_encode_set_ctx_params}, \
++        {OSSL_FUNC_ENCODER_SETTABLE_CTX_PARAMS, (void (*)(void))p_scossl_encode_settable_ctx_params}, \
++        {OSSL_FUNC_ENCODER_DOES_SELECTION, (void (*)(void))select_##type##_##format}, \
++        {OSSL_FUNC_ENCODER_ENCODE, (void (*)(void))p_scossl_encode}, \
++        {OSSL_FUNC_ENCODER_IMPORT_OBJECT, (void (*)(void))id##_encoder_import}, \
++        {OSSL_FUNC_ENCODER_FREE_OBJECT, (void (*)(void))p_scossl_composite_mldsa_free}, \
++        {0, NULL}};
++
++#define ENCODE_VARIANT(id, sym, name, oid, bits) \
++    static void *id##_encoder_import(ossl_unused void *ctx, int selection, const OSSL_PARAM params[]) \
++    { \
++        SCOSSL_COMPOSITE_MLDSA_KEY *key = p_scossl_composite_mldsa_new(SYMCRYPT_COMPOSITE_MLDSA_PARAMS_##sym); \
++        if (key != NULL && !p_scossl_composite_mldsa_import(key, selection, params)) \
++        { p_scossl_composite_mldsa_free(key); key = NULL; } \
++        return key; \
++    } \
++    ENCODE_DISPATCH(id, PrivateKeyInfo, der, DER) \
++    ENCODE_DISPATCH(id, PrivateKeyInfo, pem, PEM) \
++    ENCODE_DISPATCH(id, EncryptedPrivateKeyInfo, der, DER) \
++    ENCODE_DISPATCH(id, EncryptedPrivateKeyInfo, pem, PEM) \
++    ENCODE_DISPATCH(id, SubjectPublicKeyInfo, der, DER) \
++    ENCODE_DISPATCH(id, SubjectPublicKeyInfo, pem, PEM) \
++    const OSSL_DISPATCH p_scossl_##id##_to_text_functions[] = { \
++        {OSSL_FUNC_ENCODER_NEWCTX, (void (*)(void))new_text_TEXT}, \
++        {OSSL_FUNC_ENCODER_FREECTX, (void (*)(void))p_scossl_encode_freectx}, \
++        {OSSL_FUNC_ENCODER_DOES_SELECTION, (void (*)(void))select_text_TEXT}, \
++        {OSSL_FUNC_ENCODER_ENCODE, (void (*)(void))p_scossl_encode}, \
++        {OSSL_FUNC_ENCODER_IMPORT_OBJECT, (void (*)(void))id##_encoder_import}, \
++        {OSSL_FUNC_ENCODER_FREE_OBJECT, (void (*)(void))p_scossl_composite_mldsa_free}, \
++        {0, NULL}};
++SCOSSL_COMPOSITE_MLDSA_VARIANTS(ENCODE_VARIANT)
+diff --git a/SymCryptProvider/src/keymgmt/p_scossl_composite_mldsa_keymgmt.c b/SymCryptProvider/src/keymgmt/p_scossl_composite_mldsa_keymgmt.c
+new file mode 100644
+index 0000000..e4dbacd
+--- /dev/null
++++ b/SymCryptProvider/src/keymgmt/p_scossl_composite_mldsa_keymgmt.c
+@@ -0,0 +1,384 @@
++//
++// Copyright (c) Microsoft Corporation. Licensed under the MIT license.
++//
++
++#include "signature/p_scossl_composite_mldsa.h"
++#include <openssl/proverr.h>
++
++#define ALG_INFO(id, sym, name, oid, bits) \
++    {SYMCRYPT_COMPOSITE_MLDSA_PARAMS_##sym, name, oid, bits},
++static const SCOSSL_COMPOSITE_MLDSA_ALG algorithms[] = {
++    SCOSSL_COMPOSITE_MLDSA_VARIANTS(ALG_INFO)
++};
++#undef ALG_INFO
++
++const SCOSSL_COMPOSITE_MLDSA_ALG *p_scossl_composite_mldsa_alg(SYMCRYPT_COMPOSITE_MLDSA_PARAMS params)
++{
++    for (SIZE_T i = 0; i < sizeof(algorithms) / sizeof(algorithms[0]); ++i)
++        if (algorithms[i].params == params)
++            return &algorithms[i];
++    ERR_raise(ERR_LIB_PROV, PROV_R_NOT_SUPPORTED);
++    return NULL;
++}
++
++SCOSSL_STATUS p_scossl_composite_mldsa_register_algorithms(void)
++{
++    for (SIZE_T i = 0; i < sizeof(algorithms) / sizeof(algorithms[0]); ++i)
++    {
++        int nid = OBJ_txt2nid(algorithms[i].oid);
++        if (nid == NID_undef)
++            nid = OBJ_create(algorithms[i].oid, algorithms[i].name, algorithms[i].name);
++        if (nid == NID_undef || !OBJ_add_sigid(nid, NID_undef, nid))
++        {
++            ERR_raise(ERR_LIB_PROV, ERR_R_INIT_FAIL);
++            return SCOSSL_FAILURE;
++        }
++    }
++    return SCOSSL_SUCCESS;
++}
++
++SCOSSL_COMPOSITE_MLDSA_KEY *p_scossl_composite_mldsa_new(SYMCRYPT_COMPOSITE_MLDSA_PARAMS params)
++{
++    const SCOSSL_COMPOSITE_MLDSA_ALG *alg = p_scossl_composite_mldsa_alg(params);
++    SCOSSL_COMPOSITE_MLDSA_KEY *key;
++    if (alg == NULL)
++        return NULL;
++    key = OPENSSL_zalloc(sizeof(*key));
++    if (key == NULL)
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++    else
++        key->alg = alg;
++    return key;
++}
++
++void p_scossl_composite_mldsa_free(SCOSSL_COMPOSITE_MLDSA_KEY *key)
++{
++    if (key != NULL)
++    {
++        if (key->key != NULL)
++            SymCryptCompositeMlDsakeyFree(key->key);
++        OPENSSL_free(key);
++    }
++}
++
++SCOSSL_STATUS p_scossl_composite_mldsa_get_encoded(
++    const SCOSSL_COMPOSITE_MLDSA_KEY *key, BOOL privateKey, PBYTE *bytes, SIZE_T *length)
++{
++    SYMCRYPT_COMPOSITE_MLDSAKEY_FORMAT format = privateKey ?
++        SYMCRYPT_COMPOSITE_MLDSAKEY_FORMAT_PRIVATE_KEY : SYMCRYPT_COMPOSITE_MLDSAKEY_FORMAT_PUBLIC_KEY;
++    SYMCRYPT_ERROR error;
++    *bytes = NULL;
++    *length = 0;
++    if (key == NULL || key->key == NULL || (privateKey && !key->hasPrivate))
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_KEY);
++        return SCOSSL_FAILURE;
++    }
++    error = SymCryptCompositeMlDsaSizeofKeyFormatFromParams(key->alg->params, format, length);
++    if (error != SYMCRYPT_NO_ERROR)
++        goto symcrypt_error;
++    if ((*bytes = OPENSSL_secure_malloc(*length)) == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        return SCOSSL_FAILURE;
++    }
++    error = SymCryptCompositeMlDsakeyGetValue(key->key, *bytes, *length, format, 0);
++    if (error == SYMCRYPT_NO_ERROR)
++        return SCOSSL_SUCCESS;
++    OPENSSL_secure_clear_free(*bytes, *length);
++    *bytes = NULL;
++symcrypt_error:
++    SCOSSL_PROV_LOG_SYMCRYPT_ERROR("Composite ML-DSA key export failed", error);
++    return SCOSSL_FAILURE;
++}
++
++SCOSSL_STATUS p_scossl_composite_mldsa_set_encoded(
++    SCOSSL_COMPOSITE_MLDSA_KEY *key, BOOL privateKey, PCBYTE bytes, SIZE_T length)
++{
++    PSYMCRYPT_COMPOSITE_MLDSAKEY imported = SymCryptCompositeMlDsakeyAllocate(key->alg->params);
++    SYMCRYPT_ERROR error;
++    if (imported == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        return SCOSSL_FAILURE;
++    }
++    error = SymCryptCompositeMlDsakeySetValue(bytes, length, privateKey ?
++        SYMCRYPT_COMPOSITE_MLDSAKEY_FORMAT_PRIVATE_KEY : SYMCRYPT_COMPOSITE_MLDSAKEY_FORMAT_PUBLIC_KEY, 0, imported);
++    if (error != SYMCRYPT_NO_ERROR)
++    {
++        SymCryptCompositeMlDsakeyFree(imported);
++        SCOSSL_PROV_LOG_SYMCRYPT_ERROR("Composite ML-DSA key import failed", error);
++        return SCOSSL_FAILURE;
++    }
++    if (key->key != NULL)
++        SymCryptCompositeMlDsakeyFree(key->key);
++    key->key = imported;
++    key->hasPrivate = privateKey;
++    return SCOSSL_SUCCESS;
++}
++
++static BOOL composite_has(const SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection)
++{
++    return key != NULL &&
++        (!(selection & OSSL_KEYMGMT_SELECT_KEYPAIR) || key->key != NULL) &&
++        (!(selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) || key->hasPrivate);
++}
++
++static SCOSSL_COMPOSITE_MLDSA_KEY *composite_dup(const SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection)
++{
++    SCOSSL_COMPOSITE_MLDSA_KEY *copy = p_scossl_composite_mldsa_new(key->alg->params);
++    PBYTE bytes = NULL;
++    SIZE_T length = 0;
++    BOOL privateKey = (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) && key->hasPrivate;
++    if (copy != NULL && key->key != NULL && (selection & OSSL_KEYMGMT_SELECT_KEYPAIR) &&
++        (!p_scossl_composite_mldsa_get_encoded(key, privateKey, &bytes, &length) ||
++         !p_scossl_composite_mldsa_set_encoded(copy, privateKey, bytes, length)))
++    {
++        p_scossl_composite_mldsa_free(copy);
++        copy = NULL;
++    }
++    OPENSSL_secure_clear_free(bytes, length);
++    return copy;
++}
++
++static BOOL composite_match(const SCOSSL_COMPOSITE_MLDSA_KEY *a,
++                            const SCOSSL_COMPOSITE_MLDSA_KEY *b, int selection)
++{
++    PBYTE x = NULL, y = NULL;
++    SIZE_T nx = 0, ny = 0;
++    BOOL equal = FALSE;
++    BOOL privateKey = (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0;
++    if (!composite_has(a, selection) || !composite_has(b, selection) || a->alg != b->alg)
++        return FALSE;
++    if (!(selection & OSSL_KEYMGMT_SELECT_KEYPAIR))
++        return TRUE;
++    if (p_scossl_composite_mldsa_get_encoded(a, privateKey, &x, &nx) &&
++        p_scossl_composite_mldsa_get_encoded(b, privateKey, &y, &ny))
++        equal = nx == ny && CRYPTO_memcmp(x, y, nx) == 0;
++    OPENSSL_secure_clear_free(x, nx);
++    OPENSSL_secure_clear_free(y, ny);
++    return equal;
++}
++
++static BOOL composite_validate(const SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection,
++                               ossl_unused int checktype)
++{
++    SCOSSL_COMPOSITE_MLDSA_KEY *validated;
++    if (!composite_has(key, selection))
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_KEY);
++        return FALSE;
++    }
++    /* Reimport through SymCrypt to apply its full key-format and key-validity checks. */
++    validated = composite_dup(key, selection);
++    if (validated == NULL)
++        return FALSE;
++    p_scossl_composite_mldsa_free(validated);
++    return TRUE;
++}
++
++SCOSSL_STATUS p_scossl_composite_mldsa_import(
++    SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection, const OSSL_PARAM params[])
++{
++    const OSSL_PARAM *priv = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_PRIV_KEY);
++    const OSSL_PARAM *pub = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_PUB_KEY);
++    BOOL privateKey = (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) && priv != NULL;
++    const OSSL_PARAM *p = privateKey ? priv : pub;
++    const void *bytes = NULL;
++    SIZE_T length = 0, publicLength = 0;
++    PBYTE publicBytes = NULL;
++    SCOSSL_COMPOSITE_MLDSA_KEY *imported = NULL;
++    SCOSSL_STATUS ret = SCOSSL_FAILURE;
++    if (!(selection & OSSL_KEYMGMT_SELECT_KEYPAIR) || p == NULL ||
++        !OSSL_PARAM_get_octet_string_ptr(p, &bytes, &length))
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY);
++        return SCOSSL_FAILURE;
++    }
++    imported = p_scossl_composite_mldsa_new(key->alg->params);
++    if (imported == NULL || !p_scossl_composite_mldsa_set_encoded(imported, privateKey, bytes, length))
++        goto cleanup;
++    if (privateKey && pub != NULL)
++    {
++        if (!OSSL_PARAM_get_octet_string_ptr(pub, &bytes, &length) ||
++            !p_scossl_composite_mldsa_get_encoded(imported, FALSE, &publicBytes, &publicLength) ||
++            length != publicLength || CRYPTO_memcmp(bytes, publicBytes, length) != 0)
++        {
++            ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY);
++            goto cleanup;
++        }
++    }
++    if (key->key != NULL)
++        SymCryptCompositeMlDsakeyFree(key->key);
++    key->key = imported->key;
++    key->hasPrivate = imported->hasPrivate;
++    imported->key = NULL;
++    ret = SCOSSL_SUCCESS;
++cleanup:
++    OPENSSL_secure_clear_free(publicBytes, publicLength);
++    p_scossl_composite_mldsa_free(imported);
++    return ret;
++}
++
++SCOSSL_STATUS p_scossl_composite_mldsa_export(
++    SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection, OSSL_CALLBACK *cb, void *arg)
++{
++    PBYTE pub = NULL, priv = NULL;
++    SIZE_T pubLen = 0, privLen = 0;
++    OSSL_PARAM params[3];
++    int count = 0;
++    SCOSSL_STATUS ret = SCOSSL_FAILURE;
++    if (!(selection & OSSL_KEYMGMT_SELECT_KEYPAIR) || key->key == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_KEY);
++        return ret;
++    }
++    if (selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY)
++    {
++        if (!p_scossl_composite_mldsa_get_encoded(key, FALSE, &pub, &pubLen))
++            goto cleanup;
++        params[count++] = OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY, pub, pubLen);
++    }
++    if ((selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) && key->hasPrivate)
++    {
++        if (!p_scossl_composite_mldsa_get_encoded(key, TRUE, &priv, &privLen))
++            goto cleanup;
++        params[count++] = OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY, priv, privLen);
++    }
++    if (count == 0)
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_NOT_A_PRIVATE_KEY);
++        goto cleanup;
++    }
++    params[count] = OSSL_PARAM_construct_end();
++    ret = cb(params, arg);
++cleanup:
++    OPENSSL_secure_clear_free(pub, pubLen);
++    OPENSSL_secure_clear_free(priv, privLen);
++    return ret;
++}
++
++static const OSSL_PARAM *composite_types(ossl_unused int selection)
++{
++    static const OSSL_PARAM types[] = {
++        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PUB_KEY, NULL, 0),
++        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PRIV_KEY, NULL, 0), OSSL_PARAM_END};
++    return types;
++}
++
++static const OSSL_PARAM *composite_gettable(ossl_unused void *provctx)
++{
++    static const OSSL_PARAM types[] = {
++        OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
++        OSSL_PARAM_int(OSSL_PKEY_PARAM_SECURITY_BITS, NULL),
++        OSSL_PARAM_size_t(OSSL_PKEY_PARAM_MAX_SIZE, NULL),
++        OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_MANDATORY_DIGEST, NULL, 0),
++        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PUB_KEY, NULL, 0),
++        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PRIV_KEY, NULL, 0),
++        OSSL_PARAM_END};
++    return types;
++}
++
++static SCOSSL_STATUS composite_get_key_param(
++    const SCOSSL_COMPOSITE_MLDSA_KEY *key, OSSL_PARAM *param, BOOL privateKey)
++{
++    PBYTE bytes = NULL;
++    SIZE_T length = 0;
++    int ret;
++    if (!p_scossl_composite_mldsa_get_encoded(key, privateKey, &bytes, &length))
++        return SCOSSL_FAILURE;
++    ret = OSSL_PARAM_set_octet_string(param, bytes, length);
++    OPENSSL_secure_clear_free(bytes, length);
++    return ret;
++}
++
++static SCOSSL_STATUS composite_get_params(SCOSSL_COMPOSITE_MLDSA_KEY *key, OSSL_PARAM params[])
++{
++    OSSL_PARAM *p;
++    SIZE_T pubSize, sigSize;
++    if (SymCryptCompositeMlDsaSizeofKeyFormatFromParams(key->alg->params,
++            SYMCRYPT_COMPOSITE_MLDSAKEY_FORMAT_PUBLIC_KEY, &pubSize) != SYMCRYPT_NO_ERROR ||
++        SymCryptCompositeMlDsaSizeofSignatureFromParams(key->alg->params, &sigSize) != SYMCRYPT_NO_ERROR)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_INTERNAL_ERROR);
++        return SCOSSL_FAILURE;
++    }
++    if (((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_BITS)) && !OSSL_PARAM_set_int(p, (int)(pubSize * 8))) ||
++        ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_SECURITY_BITS)) && !OSSL_PARAM_set_int(p, key->alg->securityBits)) ||
++        ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_MAX_SIZE)) && !OSSL_PARAM_set_size_t(p, sigSize)) ||
++        ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_MANDATORY_DIGEST)) && !OSSL_PARAM_set_utf8_string(p, "")) ||
++        ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_PUB_KEY)) && !composite_get_key_param(key, p, FALSE)) ||
++        ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_PRIV_KEY)) && !composite_get_key_param(key, p, TRUE)))
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_FAILED_TO_SET_PARAMETER);
++        return SCOSSL_FAILURE;
++    }
++    return SCOSSL_SUCCESS;
++}
++
++static void *composite_load(const void *reference, size_t length)
++{
++    SCOSSL_COMPOSITE_MLDSA_KEY *key = NULL;
++    if (length == sizeof(key))
++    {
++        key = *(SCOSSL_COMPOSITE_MLDSA_KEY **)reference;
++        *(SCOSSL_COMPOSITE_MLDSA_KEY **)reference = NULL;
++    }
++    return key;
++}
++
++static void *composite_generate(SCOSSL_COMPOSITE_MLDSA_KEY *gen,
++                               ossl_unused OSSL_CALLBACK *cb, ossl_unused void *arg)
++{
++    SCOSSL_COMPOSITE_MLDSA_KEY *key = p_scossl_composite_mldsa_new(gen->alg->params);
++    SYMCRYPT_ERROR error;
++    if (key == NULL)
++        return NULL;
++    key->key = SymCryptCompositeMlDsakeyAllocate(key->alg->params);
++    if (key->key == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        goto failure;
++    }
++    error = SymCryptCompositeMlDsakeyGenerate(key->key, 0);
++    if (error != SYMCRYPT_NO_ERROR)
++    {
++        SCOSSL_PROV_LOG_SYMCRYPT_ERROR("Composite ML-DSA generation failed", error);
++        goto failure;
++    }
++    key->hasPrivate = TRUE;
++    return key;
++failure:
++    p_scossl_composite_mldsa_free(key);
++    return NULL;
++}
++
++#define KEYMGMT_VARIANT(id, sym, name, oid, bits) \
++    static void *id##_new(ossl_unused void *provctx) \
++    { return p_scossl_composite_mldsa_new(SYMCRYPT_COMPOSITE_MLDSA_PARAMS_##sym); } \
++    static void *id##_gen_init(void *provctx, int selection, const OSSL_PARAM params[]) \
++    { \
++        if (!(selection & OSSL_KEYMGMT_SELECT_KEYPAIR) || !p_scossl_is_params_empty(params)) \
++        { ERR_raise(ERR_LIB_PROV, PROV_R_NOT_SUPPORTED); return NULL; } \
++        return id##_new(provctx); \
++    } \
++    const OSSL_DISPATCH p_scossl_##id##_keymgmt_functions[] = { \
++        {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))id##_new}, \
++        {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))p_scossl_composite_mldsa_free}, \
++        {OSSL_FUNC_KEYMGMT_DUP, (void (*)(void))composite_dup}, \
++        {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))composite_has}, \
++        {OSSL_FUNC_KEYMGMT_VALIDATE, (void (*)(void))composite_validate}, \
++        {OSSL_FUNC_KEYMGMT_MATCH, (void (*)(void))composite_match}, \
++        {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))composite_get_params}, \
++        {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))composite_gettable}, \
++        {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))p_scossl_composite_mldsa_import}, \
++        {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))p_scossl_composite_mldsa_export}, \
++        {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))composite_types}, \
++        {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))composite_types}, \
++        {OSSL_FUNC_KEYMGMT_LOAD, (void (*)(void))composite_load}, \
++        {OSSL_FUNC_KEYMGMT_GEN_INIT, (void (*)(void))id##_gen_init}, \
++        {OSSL_FUNC_KEYMGMT_GEN, (void (*)(void))composite_generate}, \
++        {OSSL_FUNC_KEYMGMT_GEN_CLEANUP, (void (*)(void))p_scossl_composite_mldsa_free}, \
++        {0, NULL}};
++SCOSSL_COMPOSITE_MLDSA_VARIANTS(KEYMGMT_VARIANT)
++#undef KEYMGMT_VARIANT
+diff --git a/SymCryptProvider/src/p_scossl_base.c b/SymCryptProvider/src/p_scossl_base.c
+index 028c2f7..776ac52 100644
+--- a/SymCryptProvider/src/p_scossl_base.c
++++ b/SymCryptProvider/src/p_scossl_base.c
+@@ -14,6 +14,7 @@
+ #include "p_scossl_names.h"
+ #include "kem/p_scossl_mlkem.h"
+ #include "signature/p_scossl_mldsa.h"
++#include "signature/p_scossl_composite_mldsa.h"
+ 
+ #ifdef KEYSINUSE_ENABLED
+ #include "keysinuse.h"
+@@ -99,6 +100,29 @@ extern "C" {
+ 
+ #define ALG_TABLE_END {NULL, NULL, NULL, NULL}
+ 
++#define COMPOSITE_KEYMGMT(id, sym, name, oid, bits) \
++    {name ":id-" name ":" oid, "provider="P_SCOSSL_NAME",fips=no", p_scossl_##id##_keymgmt_functions, NULL},
++#define COMPOSITE_SIGNATURE(id, sym, name, oid, bits) \
++    {name ":id-" name ":" oid, "provider="P_SCOSSL_NAME",fips=no", p_scossl_##id##_signature_functions, NULL},
++#define COMPOSITE_DECODER_TYPE(id, name, oid, type) \
++    {name ":id-" name ":" oid, "provider="P_SCOSSL_NAME",fips=no,input=der,structure="#type, \
++     p_scossl_der_to_##id##_##type##_functions, NULL},
++#define COMPOSITE_DECODER(id, sym, name, oid, bits) \
++    COMPOSITE_DECODER_TYPE(id, name, oid, PrivateKeyInfo) \
++    COMPOSITE_DECODER_TYPE(id, name, oid, SubjectPublicKeyInfo)
++#define COMPOSITE_ENCODER_TYPE(id, name, oid, type, format) \
++    {name ":id-" name ":" oid, "provider="P_SCOSSL_NAME",fips=no,output="#format",structure="#type, \
++     p_scossl_##id##_to_##type##_##format##_functions, NULL},
++#define COMPOSITE_ENCODER(id, sym, name, oid, bits) \
++    COMPOSITE_ENCODER_TYPE(id, name, oid, PrivateKeyInfo, der) \
++    COMPOSITE_ENCODER_TYPE(id, name, oid, PrivateKeyInfo, pem) \
++    COMPOSITE_ENCODER_TYPE(id, name, oid, EncryptedPrivateKeyInfo, der) \
++    COMPOSITE_ENCODER_TYPE(id, name, oid, EncryptedPrivateKeyInfo, pem) \
++    COMPOSITE_ENCODER_TYPE(id, name, oid, SubjectPublicKeyInfo, der) \
++    COMPOSITE_ENCODER_TYPE(id, name, oid, SubjectPublicKeyInfo, pem) \
++    {name ":id-" name ":" oid, "provider="P_SCOSSL_NAME",fips=no,output=text", \
++     p_scossl_##id##_to_text_functions, NULL},
++
+ // Convenience macro to define references for all encoder/decoder types for a particular algorithm
+ #define DECODER_DISPATCH_ALL(algorithm)                                                          \
+     extern const OSSL_DISPATCH p_scossl_der_to_##algorithm##_PrivateKeyInfo_functions[];         \
+@@ -490,6 +514,7 @@ static const OSSL_ALGORITHM p_scossl_keymgmt[] = {
+     ALG(SCOSSL_ALG_NAME_MLDSA44, p_scossl_mldsa44_keymgmt_functions),
+     ALG(SCOSSL_ALG_NAME_MLDSA65, p_scossl_mldsa65_keymgmt_functions),
+     ALG(SCOSSL_ALG_NAME_MLDSA87, p_scossl_mldsa87_keymgmt_functions),
++    SCOSSL_COMPOSITE_MLDSA_VARIANTS(COMPOSITE_KEYMGMT)
+     ALG(SCOSSL_ALG_NAME_MLKEM512, p_scossl_mlkem512_keymgmt_functions),
+     ALG(SCOSSL_ALG_NAME_MLKEM768, p_scossl_mlkem768_keymgmt_functions),
+     ALG(SCOSSL_ALG_NAME_MLKEM1024, p_scossl_mlkem1024_keymgmt_functions),
+@@ -569,6 +594,7 @@ static const OSSL_ALGORITHM p_scossl_signature[] = {
+     ALG(SCOSSL_ALG_NAME_MLDSA44, p_scossl_mldsa44_signature_functions),
+     ALG(SCOSSL_ALG_NAME_MLDSA65, p_scossl_mldsa65_signature_functions),
+     ALG(SCOSSL_ALG_NAME_MLDSA87, p_scossl_mldsa87_signature_functions),
++    SCOSSL_COMPOSITE_MLDSA_VARIANTS(COMPOSITE_SIGNATURE)
+     ALG_TABLE_END};
+ 
+ // Asymmetric Cipher
+@@ -596,6 +622,11 @@ static const OSSL_ALGORITHM p_scossl_kem[] = {
+ 
+ // Decoders
+ DECODER_DISPATCH_ALL(mldsa44)
++#define COMPOSITE_CODEC_DECLARE(id, sym, name, oid, bits) \
++    DECODER_DISPATCH_ALL(id) \
++    ENCODER_DISPATCH_ALL(id)
++SCOSSL_COMPOSITE_MLDSA_VARIANTS(COMPOSITE_CODEC_DECLARE)
++#undef COMPOSITE_CODEC_DECLARE
+ DECODER_DISPATCH_ALL(mldsa65)
+ DECODER_DISPATCH_ALL(mldsa87)
+ DECODER_DISPATCH_ALL(mlkem512)
+@@ -606,6 +637,7 @@ static const OSSL_ALGORITHM p_scossl_decoder[] = {
+     DECODER_ENTRIES_ALL(SCOSSL_LN_MLDSA44, mldsa44)
+     DECODER_ENTRIES_ALL(SCOSSL_LN_MLDSA65, mldsa65)
+     DECODER_ENTRIES_ALL(SCOSSL_LN_MLDSA87, mldsa87)
++    SCOSSL_COMPOSITE_MLDSA_VARIANTS(COMPOSITE_DECODER)
+     DECODER_ENTRIES_ALL(SCOSSL_LN_MLKEM512, mlkem512)
+     DECODER_ENTRIES_ALL(SCOSSL_LN_MLKEM768, mlkem768)
+     DECODER_ENTRIES_ALL(SCOSSL_LN_MLKEM1024, mlkem1024)
+@@ -623,6 +655,7 @@ static const OSSL_ALGORITHM p_scossl_encoder[] = {
+     ENCODER_ENTRIES_ALL(SCOSSL_LN_MLDSA44, mldsa44)
+     ENCODER_ENTRIES_ALL(SCOSSL_LN_MLDSA65, mldsa65)
+     ENCODER_ENTRIES_ALL(SCOSSL_LN_MLDSA87, mldsa87)
++    SCOSSL_COMPOSITE_MLDSA_VARIANTS(COMPOSITE_ENCODER)
+     ENCODER_ENTRIES_ALL(SCOSSL_LN_MLKEM512, mlkem512)
+     ENCODER_ENTRIES_ALL(SCOSSL_LN_MLKEM768, mlkem768)
+     ENCODER_ENTRIES_ALL(SCOSSL_LN_MLKEM1024, mlkem1024)
+@@ -640,7 +673,8 @@ static const OSSL_ALGORITHM p_scossl_skeymgmt[] = {
+ static SCOSSL_STATUS p_scossl_register_extended_algorithms()
+ {
+     if (p_scossl_mlkem_register_algorithms() != SCOSSL_SUCCESS ||
+-        p_scossl_mldsa_register_algorithms() != SCOSSL_SUCCESS)
++        p_scossl_mldsa_register_algorithms() != SCOSSL_SUCCESS ||
++        p_scossl_composite_mldsa_register_algorithms() != SCOSSL_SUCCESS)
+     {
+         ERR_raise(ERR_LIB_PROV, ERR_R_INIT_FAIL);
+         return SCOSSL_FAILURE;
+diff --git a/SymCryptProvider/src/signature/p_scossl_composite_mldsa.c b/SymCryptProvider/src/signature/p_scossl_composite_mldsa.c
+new file mode 100644
+index 0000000..cd9eca5
+--- /dev/null
++++ b/SymCryptProvider/src/signature/p_scossl_composite_mldsa.c
+@@ -0,0 +1,316 @@
++//
++// Copyright (c) Microsoft Corporation. Licensed under the MIT license.
++//
++
++#include "p_scossl_composite_mldsa.h"
++#include <openssl/proverr.h>
++
++typedef struct
++{
++    const SCOSSL_COMPOSITE_MLDSA_ALG *alg;
++    SCOSSL_COMPOSITE_MLDSA_KEY *key;
++    int operation;
++    BYTE context[SYMCRYPT_COMPOSITE_MLDSA_CONTEXT_MAX_LENGTH];
++    SIZE_T contextLength;
++    BOOL initialized;
++    union
++    {
++        SYMCRYPT_SHA256_STATE sha256;
++        SYMCRYPT_SHA512_STATE sha512;
++    } hash;
++} SCOSSL_COMPOSITE_SIGNATURE_CTX;
++
++static BOOL uses_sha256(const SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx)
++{
++    return ctx->alg->params == SYMCRYPT_COMPOSITE_MLDSA_PARAMS_MLDSA44_ECDSA_P256_SHA256;
++}
++
++static void signature_free(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx)
++{
++    OPENSSL_clear_free(ctx, sizeof(*ctx));
++}
++
++static void *signature_dup(const SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx)
++{
++    SCOSSL_COMPOSITE_SIGNATURE_CTX *copy = OPENSSL_zalloc(sizeof(*copy));
++    if (copy == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        return NULL;
++    }
++    copy->alg = ctx->alg;
++    copy->key = ctx->key;
++    copy->operation = ctx->operation;
++    copy->contextLength = ctx->contextLength;
++    memcpy(copy->context, ctx->context, ctx->contextLength);
++    copy->initialized = ctx->initialized;
++    if (ctx->initialized)
++    {
++        if (uses_sha256(ctx))
++            SymCryptSha256StateCopy(&ctx->hash.sha256, &copy->hash.sha256);
++        else
++            SymCryptSha512StateCopy(&ctx->hash.sha512, &copy->hash.sha512);
++    }
++    return copy;
++}
++
++static SCOSSL_STATUS signature_set_params(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx, const OSSL_PARAM params[])
++{
++    if (params == NULL)
++        return SCOSSL_SUCCESS;
++    for (const OSSL_PARAM *p = params; p->key != NULL; ++p)
++    {
++        if (strcmp(p->key, OSSL_SIGNATURE_PARAM_CONTEXT_STRING) != 0 ||
++            p->data_type != OSSL_PARAM_OCTET_STRING || p->data_size > sizeof(ctx->context) ||
++            (p->data_size != 0 && p->data == NULL))
++        {
++            ERR_raise(ERR_LIB_PROV, PROV_R_NOT_SUPPORTED);
++            return SCOSSL_FAILURE;
++        }
++    }
++    const OSSL_PARAM *p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_CONTEXT_STRING);
++    if (p != NULL)
++    {
++        if (p->data_size != 0)
++            memcpy(ctx->context, p->data, p->data_size);
++        ctx->contextLength = p->data_size;
++    }
++    return SCOSSL_SUCCESS;
++}
++
++static const OSSL_PARAM *signature_settable(ossl_unused void *ctx, ossl_unused void *provctx)
++{
++    static const OSSL_PARAM types[] = {
++        OSSL_PARAM_octet_string(OSSL_SIGNATURE_PARAM_CONTEXT_STRING, NULL, 0), OSSL_PARAM_END};
++    return types;
++}
++
++static SCOSSL_STATUS signature_init(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx,
++    SCOSSL_COMPOSITE_MLDSA_KEY *key, const OSSL_PARAM params[], int operation)
++{
++    ctx->initialized = FALSE;
++    if (key == NULL)
++        key = ctx->key;
++    if (key == NULL || key->key == NULL || key->alg != ctx->alg ||
++        (operation == EVP_PKEY_OP_SIGN && !key->hasPrivate))
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY);
++        return SCOSSL_FAILURE;
++    }
++    if (!signature_set_params(ctx, params))
++        return SCOSSL_FAILURE;
++    ctx->key = key;
++    ctx->operation = operation;
++    if (uses_sha256(ctx))
++        SymCryptSha256Init(&ctx->hash.sha256);
++    else
++        SymCryptSha512Init(&ctx->hash.sha512);
++    ctx->initialized = TRUE;
++    return SCOSSL_SUCCESS;
++}
++
++static SCOSSL_STATUS sign_init(void *ctx, void *key, const OSSL_PARAM params[])
++{
++    return signature_init(ctx, key, params, EVP_PKEY_OP_SIGN);
++}
++
++static SCOSSL_STATUS verify_init(void *ctx, void *key, const OSSL_PARAM params[])
++{
++    return signature_init(ctx, key, params, EVP_PKEY_OP_VERIFY);
++}
++
++static SCOSSL_STATUS digest_sign_init(void *ctx, const char *md, void *key, const OSSL_PARAM params[])
++{
++    if (md != NULL && md[0] != '\0')
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_DIGEST);
++        return SCOSSL_FAILURE;
++    }
++    return sign_init(ctx, key, params);
++}
++
++static SCOSSL_STATUS digest_verify_init(void *ctx, const char *md, void *key, const OSSL_PARAM params[])
++{
++    if (md != NULL && md[0] != '\0')
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_DIGEST);
++        return SCOSSL_FAILURE;
++    }
++    return verify_init(ctx, key, params);
++}
++
++static SCOSSL_STATUS sign_internal(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx,
++    PBYTE sig, SIZE_T *siglen, SIZE_T capacity, PCBYTE message, SIZE_T length, UINT32 flags)
++{
++    SIZE_T maximum;
++    SYMCRYPT_ERROR error;
++    if (!ctx->initialized || ctx->operation != EVP_PKEY_OP_SIGN || siglen == NULL)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_OPERATION_FAIL);
++        return SCOSSL_FAILURE;
++    }
++    error = SymCryptCompositeMlDsaSizeofSignatureFromParams(ctx->alg->params, &maximum);
++    if (error != SYMCRYPT_NO_ERROR)
++        goto symcrypt_error;
++    *siglen = maximum;
++    if (sig == NULL)
++        return SCOSSL_SUCCESS;
++    if (capacity < maximum)
++    {
++        ERR_raise(ERR_LIB_PROV, PROV_R_OUTPUT_BUFFER_TOO_SMALL);
++        return SCOSSL_FAILURE;
++    }
++    error = SymCryptCompositeMlDsaSign(ctx->key->key, message, length,
++        ctx->context, ctx->contextLength, flags, sig, maximum, siglen);
++    if (error == SYMCRYPT_NO_ERROR)
++        return SCOSSL_SUCCESS;
++symcrypt_error:
++    SCOSSL_PROV_LOG_SYMCRYPT_ERROR("Composite ML-DSA signing failed", error);
++    return SCOSSL_FAILURE;
++}
++
++static SCOSSL_STATUS sign_message(void *ctx, unsigned char *sig, size_t *siglen,
++    size_t capacity, const unsigned char *message, size_t length)
++{
++    return sign_internal(ctx, sig, siglen, capacity, message, length, 0);
++}
++
++static SCOSSL_STATUS verify_internal(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx,
++    PCBYTE sig, SIZE_T siglen, PCBYTE message, SIZE_T length, UINT32 flags)
++{
++    SYMCRYPT_ERROR error;
++    if (!ctx->initialized || ctx->operation != EVP_PKEY_OP_VERIFY)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_OPERATION_FAIL);
++        return SCOSSL_FAILURE;
++    }
++    error = SymCryptCompositeMlDsaVerify(ctx->key->key, message, length,
++        ctx->context, ctx->contextLength, sig, siglen, flags);
++    if (error == SYMCRYPT_NO_ERROR)
++        return SCOSSL_SUCCESS;
++    if (error != SYMCRYPT_SIGNATURE_VERIFICATION_FAILURE)
++        SCOSSL_PROV_LOG_SYMCRYPT_ERROR("Composite ML-DSA verification failed", error);
++    return SCOSSL_FAILURE;
++}
++
++static SCOSSL_STATUS verify_message(void *ctx, const unsigned char *sig, size_t siglen,
++    const unsigned char *message, size_t length)
++{
++    return verify_internal(ctx, sig, siglen, message, length, 0);
++}
++
++static SCOSSL_STATUS signature_update(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx, PCBYTE data, SIZE_T length)
++{
++    if (!ctx->initialized)
++    {
++        ERR_raise(ERR_LIB_PROV, ERR_R_OPERATION_FAIL);
++        return SCOSSL_FAILURE;
++    }
++    if (uses_sha256(ctx))
++        SymCryptSha256Append(&ctx->hash.sha256, data, length);
++    else
++        SymCryptSha512Append(&ctx->hash.sha512, data, length);
++    return SCOSSL_SUCCESS;
++}
++
++static SIZE_T signature_digest(const SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx, PBYTE digest)
++{
++    if (uses_sha256(ctx))
++    {
++        SYMCRYPT_SHA256_STATE copy;
++        SymCryptSha256StateCopy(&ctx->hash.sha256, &copy);
++        SymCryptSha256Result(&copy, digest);
++        return SYMCRYPT_SHA256_RESULT_SIZE;
++    }
++    else
++    {
++        SYMCRYPT_SHA512_STATE copy;
++        SymCryptSha512StateCopy(&ctx->hash.sha512, &copy);
++        SymCryptSha512Result(&copy, digest);
++        return SYMCRYPT_SHA512_RESULT_SIZE;
++    }
++}
++
++static SCOSSL_STATUS sign_final(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx, PBYTE sig, SIZE_T *len, SIZE_T capacity)
++{
++    BYTE digest[SYMCRYPT_SHA512_RESULT_SIZE];
++    SIZE_T length = 0;
++    if (ctx->initialized && sig != NULL)
++        length = signature_digest(ctx, digest);
++    return sign_internal(ctx, sig, len, capacity, digest, length, SYMCRYPT_FLAG_COMPOSITE_MLDSA_PREHASHED);
++}
++
++static SCOSSL_STATUS verify_final(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx, PCBYTE sig, SIZE_T len)
++{
++    BYTE digest[SYMCRYPT_SHA512_RESULT_SIZE];
++    SIZE_T length = ctx->initialized ? signature_digest(ctx, digest) : 0;
++    return verify_internal(ctx, sig, len, digest, length, SYMCRYPT_FLAG_COMPOSITE_MLDSA_PREHASHED);
++}
++
++static const OSSL_PARAM *signature_gettable(ossl_unused void *ctx, ossl_unused void *provctx)
++{
++    static const OSSL_PARAM types[] = {
++        OSSL_PARAM_octet_string(OSSL_SIGNATURE_PARAM_ALGORITHM_ID, NULL, 0), OSSL_PARAM_END};
++    return types;
++}
++
++static SCOSSL_STATUS signature_get_params(SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx, OSSL_PARAM params[])
++{
++    OSSL_PARAM *p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_ALGORITHM_ID);
++    X509_ALGOR *algor = NULL;
++    ASN1_OBJECT *oid = NULL;
++    PBYTE der = NULL;
++    int length;
++    SCOSSL_STATUS ret = SCOSSL_FAILURE;
++    if (p == NULL)
++        return SCOSSL_SUCCESS;
++    algor = X509_ALGOR_new();
++    oid = OBJ_txt2obj(ctx->alg->oid, 1);
++    if (algor == NULL || oid == NULL || !X509_ALGOR_set0(algor, oid, V_ASN1_UNDEF, NULL))
++        goto cleanup;
++    oid = NULL;
++    length = i2d_X509_ALGOR(algor, &der);
++    if (length > 0 && OSSL_PARAM_set_octet_string(p, der, (SIZE_T)length))
++        ret = SCOSSL_SUCCESS;
++cleanup:
++    if (!ret)
++        ERR_raise(ERR_LIB_PROV, PROV_R_FAILED_TO_SET_PARAMETER);
++    ASN1_OBJECT_free(oid);
++    X509_ALGOR_free(algor);
++    OPENSSL_free(der);
++    return ret;
++}
++
++#define SIGNATURE_VARIANT(id, sym, name, oid, bits) \
++    static void *id##_sig_new(ossl_unused void *provctx, ossl_unused const char *propq) \
++    { \
++        SCOSSL_COMPOSITE_SIGNATURE_CTX *ctx = OPENSSL_zalloc(sizeof(*ctx)); \
++        if (ctx == NULL) ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE); \
++        else ctx->alg = p_scossl_composite_mldsa_alg(SYMCRYPT_COMPOSITE_MLDSA_PARAMS_##sym); \
++        return ctx; \
++    } \
++    const OSSL_DISPATCH p_scossl_##id##_signature_functions[] = { \
++        {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))id##_sig_new}, \
++        {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))signature_free}, \
++        {OSSL_FUNC_SIGNATURE_DUPCTX, (void (*)(void))signature_dup}, \
++        {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))sign_init}, \
++        {OSSL_FUNC_SIGNATURE_VERIFY_INIT, (void (*)(void))verify_init}, \
++        {OSSL_FUNC_SIGNATURE_SIGN_MESSAGE_INIT, (void (*)(void))sign_init}, \
++        {OSSL_FUNC_SIGNATURE_VERIFY_MESSAGE_INIT, (void (*)(void))verify_init}, \
++        {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))sign_message}, \
++        {OSSL_FUNC_SIGNATURE_VERIFY, (void (*)(void))verify_message}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))digest_sign_init}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_VERIFY_INIT, (void (*)(void))digest_verify_init}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))sign_message}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_VERIFY, (void (*)(void))verify_message}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))signature_update}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_VERIFY_UPDATE, (void (*)(void))signature_update}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))sign_final}, \
++        {OSSL_FUNC_SIGNATURE_DIGEST_VERIFY_FINAL, (void (*)(void))verify_final}, \
++        {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))signature_set_params}, \
++        {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))signature_settable}, \
++        {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))signature_get_params}, \
++        {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))signature_gettable}, \
++        {0, NULL}};
++SCOSSL_COMPOSITE_MLDSA_VARIANTS(SIGNATURE_VARIANT)
++#undef SIGNATURE_VARIANT
+diff --git a/SymCryptProvider/src/signature/p_scossl_composite_mldsa.h b/SymCryptProvider/src/signature/p_scossl_composite_mldsa.h
+new file mode 100644
+index 0000000..3cb1fbd
+--- /dev/null
++++ b/SymCryptProvider/src/signature/p_scossl_composite_mldsa.h
+@@ -0,0 +1,49 @@
++//
++// Copyright (c) Microsoft Corporation. Licensed under the MIT license.
++//
++
++#pragma once
++
++#include "p_scossl_base.h"
++
++#define SCOSSL_COMPOSITE_MLDSA_VARIANTS(X) \
++    X(mldsa44_p256, MLDSA44_ECDSA_P256_SHA256, "MLDSA44-ECDSA-P256-SHA256", "1.3.6.1.5.5.7.6.40", 128) \
++    X(mldsa65_p256, MLDSA65_ECDSA_P256_SHA512, "MLDSA65-ECDSA-P256-SHA512", "1.3.6.1.5.5.7.6.45", 192) \
++    X(mldsa65_p384, MLDSA65_ECDSA_P384_SHA512, "MLDSA65-ECDSA-P384-SHA512", "1.3.6.1.5.5.7.6.46", 192) \
++    X(mldsa87_p384, MLDSA87_ECDSA_P384_SHA512, "MLDSA87-ECDSA-P384-SHA512", "1.3.6.1.5.5.7.6.49", 256)
++
++typedef struct
++{
++    SYMCRYPT_COMPOSITE_MLDSA_PARAMS params;
++    const char *name;
++    const char *oid;
++    int securityBits;
++} SCOSSL_COMPOSITE_MLDSA_ALG;
++
++typedef struct
++{
++    const SCOSSL_COMPOSITE_MLDSA_ALG *alg;
++    PSYMCRYPT_COMPOSITE_MLDSAKEY key;
++    BOOL hasPrivate;
++} SCOSSL_COMPOSITE_MLDSA_KEY;
++
++const SCOSSL_COMPOSITE_MLDSA_ALG *p_scossl_composite_mldsa_alg(SYMCRYPT_COMPOSITE_MLDSA_PARAMS params);
++SCOSSL_STATUS p_scossl_composite_mldsa_register_algorithms(void);
++SCOSSL_COMPOSITE_MLDSA_KEY *p_scossl_composite_mldsa_new(SYMCRYPT_COMPOSITE_MLDSA_PARAMS params);
++void p_scossl_composite_mldsa_free(_In_opt_ SCOSSL_COMPOSITE_MLDSA_KEY *key);
++SCOSSL_STATUS p_scossl_composite_mldsa_get_encoded(
++    _In_ const SCOSSL_COMPOSITE_MLDSA_KEY *key, BOOL privateKey,
++    _Out_ PBYTE *bytes, _Out_ SIZE_T *length);
++SCOSSL_STATUS p_scossl_composite_mldsa_set_encoded(
++    _Inout_ SCOSSL_COMPOSITE_MLDSA_KEY *key, BOOL privateKey,
++    _In_reads_bytes_(length) PCBYTE bytes, SIZE_T length);
++SCOSSL_STATUS p_scossl_composite_mldsa_import(
++    _Inout_ SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection, _In_ const OSSL_PARAM params[]);
++SCOSSL_STATUS p_scossl_composite_mldsa_export(
++    _In_ SCOSSL_COMPOSITE_MLDSA_KEY *key, int selection, OSSL_CALLBACK *cb, void *arg);
++
++#define SCOSSL_COMPOSITE_DECLARE(id, sym, name, oid, bits) \
++    extern const OSSL_DISPATCH p_scossl_##id##_keymgmt_functions[]; \
++    extern const OSSL_DISPATCH p_scossl_##id##_signature_functions[];
++SCOSSL_COMPOSITE_MLDSA_VARIANTS(SCOSSL_COMPOSITE_DECLARE)
++#undef SCOSSL_COMPOSITE_DECLARE
