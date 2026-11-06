@@ -1,0 +1,2 @@
+cmake/patches/scossl-composite-mldsa.patch text eol=lf
+cmake/patches/symcrypt-curve-cache.patch text eol=crlf

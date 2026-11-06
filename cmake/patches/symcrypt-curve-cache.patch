@@ -2,8 +2,7 @@ diff --git a/inc/symcrypt_internal.h b/inc/symcrypt_internal.h
 index f17b50c..4f0135b 100644
 --- a/inc/symcrypt_internal.h
 +++ b/inc/symcrypt_internal.h
-@@ -3228,6 +3228,12 @@ typedef struct _SYMCRYPT_EXTENDED_SAVE_DATA      SYMCRYPT_EXTENDED_SAVE_DATA, *P
- 
+@@ -3229,5 +3229,11 @@
  #endif
  
 +// Module teardown only: all users of cached curves must have stopped and freed their keys.
