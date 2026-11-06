@@ -19,6 +19,7 @@ Supported means the subset described here, not full Windows equivalence.
 | 7 | `CertCreateCertificateContext`, `CertDuplicateCertificateContext`, `CertFreeCertificateContext` | DER validation, populated `CERT_INFO`, reference counting. Duplicate returns the same pointer. |
 | 8 | `CertGetCertificateContextProperty`, `CertSetCertificateContextProperty`, `CertEnumCertificateContextProperties` | Friendly name, description, archived, key identifier, application properties `0x8000..0xffff`; computed SHA-1/SHA-256/MD5. |
 | 9 | `CertGetStoreProperty`, `CertSetStoreProperty` | Localized name and application properties `0x8000..0xffff`. |
+| 10 | `CertGetCertificateChain`, `CertFreeCertificateChain`, `CertVerifyCertificateChainPolicy` | Offline single-chain construction from an optional store plus current-user CA/ROOT views; base policy validates trust, time, signatures, CA/key-usage and path-length constraints. |
 | 11 | `CertSaveStore` | Unsigned certificate-only PKCS#7 export to memory; two-call size-query convention. Other output formats/targets fail. |
 | 12 | `CertControlStore` | Immediate SQLite persistence and commit flush; native resync; unsupported controls fail. |
 | 13 | `CertEnumSystemStore`, `CertEnumSystemStoreLocation` | User/computer locations, predefined ROOT/CA/MY and persisted custom-store names; callback early termination. |
@@ -81,6 +82,15 @@ it is not a Crypt32 API.
   and key access are denied; modify the computer store explicitly instead.
   Searches, issuer lookups and PKCS#7 export include inherited entries. Local
   and inherited duplicate memberships are both enumerated, local first.
+- Chain construction is offline and supports only the default chain engine,
+  current time, zero flags, and empty usage/issuance/revocation/strong-sign
+  options. Issuers are selected from the optional additional store, then the
+  current-user `CA` and `ROOT` views, with SHA-256 de-duplication and trusted
+  roots preferred among valid matches. No AIA retrieval or revocation checking
+  occurs. The base policy reports untrusted root, partial/cyclic chains,
+  expiration, signature failure, wrong usage, and invalid basic constraints
+  through `CERT_CHAIN_POLICY_STATUS.dwError`; the API return value reports
+  whether policy evaluation itself completed.
 - Computer certificate files and metadata are readable independently of keys.
   New computer object directories use `0755`, certificate/metadata files `0644`,
   key directories `0700` and key files `0600`. Private-key files are opened

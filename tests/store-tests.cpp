@@ -59,6 +59,13 @@ struct Certificate {
     Certificate(const Certificate&) = delete;
     Certificate& operator=(const Certificate&) = delete;
 };
+struct Chain {
+    PCCERT_CHAIN_CONTEXT value = nullptr;
+    explicit Chain(PCCERT_CHAIN_CONTEXT context) : value(context) { CHECK(value); }
+    ~Chain() { if (value) CertFreeCertificateChain(value); }
+    Chain(const Chain&) = delete;
+    Chain& operator=(const Chain&) = delete;
+};
 struct TempDir {
     std::filesystem::path path;
     TempDir() {
@@ -124,13 +131,14 @@ Key signing_key(const char* algorithm) {
 }
 X509Handle make_x509(EVP_PKEY* subject_key, long serial, const char* name, bool ca,
     X509* issuer = nullptr, EVP_PKEY* issuer_key = nullptr, long not_before = -60,
-    const EVP_MD* digest = EVP_sha256(), const char* crl_url = nullptr) {
+    const EVP_MD* digest = EVP_sha256(), const char* crl_url = nullptr,
+    long not_after = 86400, int path_length = -1, int key_cert_sign = -1) {
     X509Handle result(X509_new(), X509_free);
     CHECK(result);
     CHECK(X509_set_version(result.get(), 2) == 1);
     CHECK(ASN1_INTEGER_set(X509_get_serialNumber(result.get()), serial) == 1);
     CHECK(X509_gmtime_adj(X509_getm_notBefore(result.get()), not_before));
-    CHECK(X509_gmtime_adj(X509_getm_notAfter(result.get()), 86400));
+    CHECK(X509_gmtime_adj(X509_getm_notAfter(result.get()), not_after));
     CHECK(X509_set_pubkey(result.get(), subject_key) == 1);
     auto* subject = X509_get_subject_name(result.get());
     CHECK(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_UTF8,
@@ -138,10 +146,16 @@ X509Handle make_x509(EVP_PKEY* subject_key, long serial, const char* name, bool 
     CHECK(X509_set_issuer_name(result.get(), issuer ? X509_get_subject_name(issuer) : subject) == 1);
     X509V3_CTX context{};
     X509V3_set_ctx(&context, issuer ? issuer : result.get(), result.get(), nullptr, nullptr, 0);
+    std::string constraints = ca ? "critical,CA:TRUE" : "critical,CA:FALSE";
+    if (path_length >= 0) constraints += ",pathlen:" + std::to_string(path_length);
     std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> extension(
-        X509V3_EXT_conf_nid(nullptr, &context, NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE"),
-        X509_EXTENSION_free);
+        X509V3_EXT_conf_nid(nullptr, &context, NID_basic_constraints, constraints.c_str()), X509_EXTENSION_free);
     CHECK(extension && X509_add_ext(result.get(), extension.get(), -1) == 1);
+    if (key_cert_sign >= 0) {
+        extension.reset(X509V3_EXT_conf_nid(nullptr, &context, NID_key_usage,
+            key_cert_sign ? "critical,keyCertSign" : "critical,digitalSignature"));
+        CHECK(extension && X509_add_ext(result.get(), extension.get(), -1) == 1);
+    }
     if (crl_url) {
         std::string value = "URI:";
         value += crl_url;
@@ -354,6 +368,21 @@ std::filesystem::path material_path(PCCERT_CONTEXT context, BOOL private_key = F
     return result.data();
 }
 HCERTSTORE memory() { return CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, nullptr); }
+PCCERT_CHAIN_CONTEXT build_chain(PCCERT_CONTEXT certificate, HCERTSTORE additional = nullptr) {
+    CERT_CHAIN_PARA parameters{};
+    parameters.cbSize = sizeof(parameters);
+    PCCERT_CHAIN_CONTEXT result = nullptr;
+    CHECK(CertGetCertificateChain(nullptr, certificate, nullptr, additional, &parameters, 0, nullptr, &result));
+    return result;
+}
+CERT_CHAIN_POLICY_STATUS verify_base_policy(PCCERT_CHAIN_CONTEXT chain) {
+    CERT_CHAIN_POLICY_PARA parameters{};
+    parameters.cbSize = sizeof(parameters);
+    CERT_CHAIN_POLICY_STATUS status{};
+    status.cbSize = sizeof(status);
+    CHECK(CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASE, chain, &parameters, &status));
+    return status;
+}
 
 void memory_tests() {
     auto signer = key();
@@ -988,6 +1017,7 @@ void system_scope_tests() {
         CHECK(names.contains(L"CUSTOM"));
         CHECK(!names.contains(L"INTERMEDIATE"));
     }
+
     {
         auto directory = std::filesystem::path(first_user);
         std::filesystem::rename(directory / "CUSTOM.db", directory / "custom.db");
@@ -1110,6 +1140,176 @@ void system_scope_tests() {
         int status = 0;
         CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
+    CHECK(SysCertConfigureSystemStores(nullptr));
+}
+
+void chain_tests() {
+    TempDir temp;
+    auto system = temp.path / "system";
+    write_file(system / "etc/os-release", "ID=ubuntu\n");
+
+    auto expired_trusted_key = key();
+    auto expired_trusted = make_x509(expired_trusted_key.get(), 101, "Expired Trusted Root", true,
+        nullptr, nullptr, -10 * 86400, EVP_sha256(), nullptr, -5 * 86400, -1, 1);
+    auto expired_untrusted_key = key();
+    auto expired_untrusted = make_x509(expired_untrusted_key.get(), 102, "Expired Untrusted Root", true,
+        nullptr, nullptr, -10 * 86400, EVP_sha256(), nullptr, -5 * 86400, -1, 1);
+    auto non_ca_key = key();
+    auto non_ca = make_x509(non_ca_key.get(), 103, "Not A CA", false,
+        nullptr, nullptr, -60, EVP_sha256(), nullptr, 86400, -1, 0);
+    auto non_ca_leaf_key = key();
+    auto non_ca_leaf = make_x509(non_ca_leaf_key.get(), 104, "Non-CA Issued Leaf", false,
+        non_ca.get(), non_ca_key.get());
+    auto path_root_key = key();
+    auto path_root = make_x509(path_root_key.get(), 105, "Path Length Root", true,
+        nullptr, nullptr, -60, EVP_sha256(), nullptr, 86400, 0, 1);
+    auto intermediate_key = key();
+    auto intermediate = make_x509(intermediate_key.get(), 106, "Intermediate", true,
+        path_root.get(), path_root_key.get(), -60, EVP_sha256(), nullptr, 86400, -1, 1);
+    auto path_leaf_key = key();
+    auto path_leaf = make_x509(path_leaf_key.get(), 107, "Path Length Leaf", false,
+        intermediate.get(), intermediate_key.get());
+    auto missing_key = key();
+    auto missing_issuer = make_x509(missing_key.get(), 108, "Missing Issuer", true);
+    auto partial_leaf_key = key();
+    auto partial_leaf = make_x509(partial_leaf_key.get(), 109, "Partial Leaf", false,
+        missing_issuer.get(), missing_key.get());
+    auto no_sign_ca_key = key();
+    auto no_sign_ca = make_x509(no_sign_ca_key.get(), 110, "No Certificate Sign CA", true,
+        nullptr, nullptr, -60, EVP_sha256(), nullptr, 86400, -1, 0);
+    auto no_sign_leaf_key = key();
+    auto no_sign_leaf = make_x509(no_sign_leaf_key.get(), 111, "No Certificate Sign Leaf", false,
+        no_sign_ca.get(), no_sign_ca_key.get());
+    auto valid_root_key = key();
+    auto valid_root = make_x509(valid_root_key.get(), 112, "Valid Trusted Root", true,
+        nullptr, nullptr, -60, EVP_sha256(), nullptr, 86400, -1, 1);
+    auto signature_root_key = key();
+    auto signature_root = make_x509(signature_root_key.get(), 113, "Signature Root", true,
+        nullptr, nullptr, -60, EVP_sha256(), nullptr, 86400, -1, 1);
+    auto wrong_signing_key = key();
+    auto invalid_signature_leaf_key = key();
+    auto invalid_signature_leaf = make_x509(invalid_signature_leaf_key.get(), 114,
+        "Invalid Signature Leaf", false, signature_root.get(), wrong_signing_key.get());
+
+    std::string trusted_bundle;
+    for (auto* certificate : {expired_trusted.get(), non_ca.get(), path_root.get(),
+        no_sign_ca.get(), valid_root.get(), signature_root.get()})
+        trusted_bundle += pem(certificate);
+    write_file(system / "etc/ssl/certs/ca-certificates.crt", trusted_bundle);
+    auto user = (temp.path / "user").string();
+    auto machine = (temp.path / "machine").string();
+    auto root = system.string();
+    SYS_CERT_STORE_CONFIGURATION configuration{
+        sizeof(configuration), user.c_str(), machine.c_str(), root.c_str()};
+    CHECK(SysCertConfigureSystemStores(&configuration));
+    {
+        Certificate context(create(der(expired_untrusted.get())));
+        Chain chain(build_chain(context.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus ==
+            (CERT_TRUST_IS_NOT_TIME_VALID | CERT_TRUST_IS_UNTRUSTED_ROOT));
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == CERT_E_UNTRUSTEDROOT && policy.lChainIndex == 0 &&
+            policy.lElementIndex == 0);
+    }
+    {
+        Certificate context(create(der(expired_trusted.get())));
+        Chain chain(build_chain(context.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus == CERT_TRUST_IS_NOT_TIME_VALID);
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == CERT_E_EXPIRED && policy.lElementIndex == 0);
+    }
+    {
+        Store candidates(memory());
+        Certificate issuer(create(der(non_ca.get())));
+        Certificate added(add(candidates.value, issuer.value));
+        Certificate leaf(create(der(non_ca_leaf.get())));
+        Chain chain(build_chain(leaf.value, candidates.value));
+        auto* simple = chain.value->rgpChain[0];
+        CHECK(simple->TrustStatus.dwErrorStatus ==
+            (CERT_TRUST_IS_NOT_VALID_FOR_USAGE | CERT_TRUST_INVALID_BASIC_CONSTRAINTS));
+        CHECK(simple->rgpElement[1]->TrustStatus.dwErrorStatus ==
+            (CERT_TRUST_IS_NOT_VALID_FOR_USAGE | CERT_TRUST_INVALID_BASIC_CONSTRAINTS));
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == CERT_E_WRONG_USAGE && policy.lElementIndex == 1);
+    }
+    {
+        Store candidates(memory());
+        Certificate issuer(create(der(no_sign_ca.get())));
+        Certificate added(add(candidates.value, issuer.value));
+        Certificate leaf(create(der(no_sign_leaf.get())));
+        Chain chain(build_chain(leaf.value, candidates.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus == CERT_TRUST_IS_NOT_VALID_FOR_USAGE);
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == CERT_E_WRONG_USAGE && policy.lElementIndex == 1);
+    }
+    {
+        Store candidates(memory());
+        Certificate issuer(create(der(intermediate.get())));
+        Certificate added(add(candidates.value, issuer.value));
+        Certificate leaf(create(der(path_leaf.get())));
+        Chain chain(build_chain(leaf.value, candidates.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus == CERT_TRUST_INVALID_BASIC_CONSTRAINTS);
+        CHECK(chain.value->rgpChain[0]->rgpElement[2]->TrustStatus.dwErrorStatus ==
+            CERT_TRUST_INVALID_BASIC_CONSTRAINTS);
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == TRUST_E_BASIC_CONSTRAINTS && policy.lElementIndex == 2);
+    }
+    {
+        Store candidates(memory());
+        Certificate issuer(create(der(signature_root.get())));
+        Certificate added(add(candidates.value, issuer.value));
+        Certificate leaf(create(der(invalid_signature_leaf.get())));
+        Chain chain(build_chain(leaf.value, candidates.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus == CERT_TRUST_IS_NOT_SIGNATURE_VALID);
+        CHECK(chain.value->rgpChain[0]->rgpElement[0]->TrustStatus.dwErrorStatus ==
+            CERT_TRUST_IS_NOT_SIGNATURE_VALID);
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == TRUST_E_CERT_SIGNATURE && policy.lElementIndex == 0);
+    }
+    {
+        Certificate context(create(der(valid_root.get())));
+        Chain chain(build_chain(context.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus == 0);
+        CHECK(chain.value->TrustStatus.dwInfoStatus == CERT_TRUST_IS_SELF_SIGNED);
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == ERROR_SUCCESS && policy.lChainIndex == -1 &&
+            policy.lElementIndex == -1);
+    }
+    {
+        Certificate context(create(der(partial_leaf.get())));
+        Chain chain(build_chain(context.value));
+        CHECK(chain.value->TrustStatus.dwErrorStatus == CERT_TRUST_IS_PARTIAL_CHAIN);
+        auto policy = verify_base_policy(chain.value);
+        CHECK(policy.dwError == CERT_E_CHAINING && policy.lChainIndex == 0 &&
+            policy.lElementIndex == -1);
+    }
+    {
+        auto* context = create(der(valid_root.get()));
+        CHECK(context);
+        auto* chain = build_chain(context);
+        CHECK(CertFreeCertificateContext(context));
+        CHECK(chain->rgpChain[0]->rgpElement[0]->pCertContext->cbCertEncoded ==
+            der(valid_root.get()).size());
+        CertFreeCertificateChain(chain);
+    }
+    {
+        Certificate context(create(der(valid_root.get())));
+        CERT_CHAIN_PARA parameters{};
+        parameters.cbSize = sizeof(parameters);
+        parameters.dwUrlRetrievalTimeout = 1;
+        PCCERT_CHAIN_CONTEXT chain = nullptr;
+        CHECK(!CertGetCertificateChain(nullptr, context.value, nullptr, nullptr,
+            &parameters, 0, nullptr, &chain));
+        CHECK(GetLastError() == ERROR_NOT_SUPPORTED && !chain);
+        CERT_CHAIN_POLICY_PARA policy_parameters{};
+        policy_parameters.cbSize = sizeof(policy_parameters);
+        CERT_CHAIN_POLICY_STATUS status{};
+        status.cbSize = sizeof(status);
+        CHECK(!CertVerifyCertificateChainPolicy(reinterpret_cast<LPCSTR>(2),
+            nullptr, &policy_parameters, &status));
+        CHECK(GetLastError() == E_INVALIDARG);
+    }
+    CertFreeCertificateChain(nullptr);
     CHECK(SysCertConfigureSystemStores(nullptr));
 }
 
@@ -1571,6 +1771,7 @@ int main(int argc, char** argv) {
         error_tests();
         thread_tests();
         system_scope_tests();
+        chain_tests();
         dotnet_crl_cache_tests();
         std::cout << "All certificate-store tests passed\n";
         return 0;

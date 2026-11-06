@@ -11,6 +11,7 @@ using LPCSTR = const char*;
 using LPCWSTR = const WCHAR*;
 using HCRYPTPROV_LEGACY = std::uintptr_t;
 using HCERTSTORE = void*;
+using HCERTCHAINENGINE = void*;
 inline constexpr BOOL TRUE = 1;
 inline constexpr BOOL FALSE = 0;
 
@@ -54,6 +55,79 @@ using PCERT_CONTEXT = CERT_CONTEXT*;
 using PCCERT_CONTEXT = const CERT_CONTEXT*;
 struct CERT_SYSTEM_STORE_INFO { DWORD cbSize; };
 using PCERT_SYSTEM_STORE_INFO = CERT_SYSTEM_STORE_INFO*;
+struct GUID {
+    DWORD Data1;
+    std::uint16_t Data2;
+    std::uint16_t Data3;
+    BYTE Data4[8];
+};
+struct CERT_ENHKEY_USAGE {
+    DWORD cUsageIdentifier;
+    char** rgpszUsageIdentifier;
+};
+struct CERT_USAGE_MATCH {
+    DWORD dwType;
+    CERT_ENHKEY_USAGE Usage;
+};
+struct CERT_CHAIN_PARA {
+    DWORD cbSize;
+    CERT_USAGE_MATCH RequestedUsage;
+    CERT_USAGE_MATCH RequestedIssuancePolicy;
+    DWORD dwUrlRetrievalTimeout;
+    BOOL fCheckRevocationFreshnessTime;
+    DWORD dwRevocationFreshnessTime;
+    FILETIME* pftCacheResync;
+    const void* pStrongSignPara;
+    DWORD dwStrongSignFlags;
+};
+struct CERT_TRUST_STATUS {
+    DWORD dwErrorStatus;
+    DWORD dwInfoStatus;
+};
+struct CERT_CHAIN_ELEMENT {
+    DWORD cbSize;
+    PCCERT_CONTEXT pCertContext;
+    CERT_TRUST_STATUS TrustStatus;
+    void* pRevocationInfo;
+    CERT_ENHKEY_USAGE* pIssuanceUsage;
+    CERT_ENHKEY_USAGE* pApplicationUsage;
+    LPCWSTR pwszExtendedErrorInfo;
+};
+struct CERT_SIMPLE_CHAIN {
+    DWORD cbSize;
+    CERT_TRUST_STATUS TrustStatus;
+    DWORD cElement;
+    CERT_CHAIN_ELEMENT** rgpElement;
+    void* pTrustListInfo;
+    BOOL fHasRevocationFreshnessTime;
+    DWORD dwRevocationFreshnessTime;
+};
+struct CERT_CHAIN_CONTEXT {
+    DWORD cbSize;
+    CERT_TRUST_STATUS TrustStatus;
+    DWORD cChain;
+    CERT_SIMPLE_CHAIN** rgpChain;
+    DWORD cLowerQualityChainContext;
+    const CERT_CHAIN_CONTEXT** rgpLowerQualityChainContext;
+    BOOL fHasRevocationFreshnessTime;
+    DWORD dwRevocationFreshnessTime;
+    DWORD dwCreateFlags;
+    GUID ChainId;
+};
+using PCERT_CHAIN_CONTEXT = CERT_CHAIN_CONTEXT*;
+using PCCERT_CHAIN_CONTEXT = const CERT_CHAIN_CONTEXT*;
+struct CERT_CHAIN_POLICY_PARA {
+    DWORD cbSize;
+    DWORD dwFlags;
+    void* pvExtraPolicyPara;
+};
+struct CERT_CHAIN_POLICY_STATUS {
+    DWORD cbSize;
+    DWORD dwError;
+    std::int32_t lChainIndex;
+    std::int32_t lElementIndex;
+    void* pvExtraPolicyStatus;
+};
 using PFN_CERT_ENUM_SYSTEM_STORE = BOOL (*)(const void*, DWORD, PCERT_SYSTEM_STORE_INFO, void*, void*);
 using PFN_CERT_ENUM_SYSTEM_STORE_LOCATION = BOOL (*)(LPCWSTR, DWORD, void*, void*);
 
@@ -122,6 +196,15 @@ inline constexpr DWORD CRYPT_EXPORTABLE = 1;
 inline constexpr DWORD CRYPT_USER_KEYSET = 0x1000;
 inline constexpr DWORD CRYPT_MACHINE_KEYSET = 0x20;
 inline constexpr DWORD PKCS12_NO_PERSIST_KEY = 0x8000;
+#define CERT_CHAIN_POLICY_BASE reinterpret_cast<LPCSTR>(1)
+inline constexpr DWORD CERT_TRUST_IS_NOT_TIME_VALID = 0x00000001;
+inline constexpr DWORD CERT_TRUST_IS_NOT_SIGNATURE_VALID = 0x00000008;
+inline constexpr DWORD CERT_TRUST_IS_NOT_VALID_FOR_USAGE = 0x00000010;
+inline constexpr DWORD CERT_TRUST_IS_UNTRUSTED_ROOT = 0x00000020;
+inline constexpr DWORD CERT_TRUST_IS_CYCLIC = 0x00000080;
+inline constexpr DWORD CERT_TRUST_INVALID_BASIC_CONSTRAINTS = 0x00000400;
+inline constexpr DWORD CERT_TRUST_IS_PARTIAL_CHAIN = 0x00010000;
+inline constexpr DWORD CERT_TRUST_IS_SELF_SIGNED = 0x00000008;
 
 inline constexpr DWORD ERROR_SUCCESS = 0;
 inline constexpr DWORD ERROR_FILE_NOT_FOUND = 2;
@@ -140,6 +223,12 @@ inline constexpr DWORD CRYPT_E_EXISTS = 0x80092005;
 inline constexpr DWORD CRYPT_E_NO_MATCH = 0x80092009;
 inline constexpr DWORD CRYPT_E_PENDING_CLOSE = 0x8009200f;
 inline constexpr DWORD CRYPT_E_SELF_SIGNED = 0x80092007;
+inline constexpr DWORD TRUST_E_CERT_SIGNATURE = 0x80096004;
+inline constexpr DWORD TRUST_E_BASIC_CONSTRAINTS = 0x80096019;
+inline constexpr DWORD CERT_E_EXPIRED = 0x800b0101;
+inline constexpr DWORD CERT_E_UNTRUSTEDROOT = 0x800b0109;
+inline constexpr DWORD CERT_E_CHAINING = 0x800b010a;
+inline constexpr DWORD CERT_E_WRONG_USAGE = 0x800b0110;
 
 extern "C" {
 DWORD GetLastError() noexcept;
@@ -176,6 +265,12 @@ BOOL CertSetStoreProperty(HCERTSTORE store, DWORD property, DWORD flags, const v
 BOOL CertControlStore(HCERTSTORE store, DWORD flags, DWORD control, const void* parameter) noexcept;
 BOOL CertSaveStore(HCERTSTORE store, DWORD encoding, DWORD saveAs, DWORD saveTo,
     void* parameter, DWORD flags) noexcept;
+BOOL CertGetCertificateChain(HCERTCHAINENGINE chainEngine, PCCERT_CONTEXT certificate,
+    const FILETIME* time, HCERTSTORE additionalStore, const CERT_CHAIN_PARA* parameters,
+    DWORD flags, void* reserved, PCCERT_CHAIN_CONTEXT* chainContext) noexcept;
+void CertFreeCertificateChain(PCCERT_CHAIN_CONTEXT chainContext) noexcept;
+BOOL CertVerifyCertificateChainPolicy(LPCSTR policy, PCCERT_CHAIN_CONTEXT chainContext,
+    const CERT_CHAIN_POLICY_PARA* parameters, CERT_CHAIN_POLICY_STATUS* status) noexcept;
 HCERTSTORE PFXImportCertStore(CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flags) noexcept;
 }
 

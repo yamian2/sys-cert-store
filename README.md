@@ -140,6 +140,23 @@ update executables. Existing computer files created with earlier private-only
 permissions retain those restrictions; the library does not silently loosen
 permissions on existing stores.
 
+## Certificate chains
+
+`CertGetCertificateChain` constructs one offline chain from the leaf, an
+optional additional store, and the current-user `CA` and `ROOT` views (including
+their inherited computer certificates). Candidate certificates are
+de-duplicated by SHA-256 fingerprint; signature-valid issuers are preferred,
+and trusted-root candidates win deterministic ties. The returned context owns
+references to every certificate element until `CertFreeCertificateChain`.
+
+The implementation validates current-time validity, issuer signatures, CA
+basic constraints, `keyCertSign`, path-length constraints, partial chains,
+cycles, and root trust. `CertVerifyCertificateChainPolicy` supports
+`CERT_CHAIN_POLICY_BASE` and reports the prioritized validation result in
+`CERT_CHAIN_POLICY_STATUS`. Chain building does not perform AIA retrieval,
+network access, or revocation checks, and custom engines, validation times,
+usage constraints, and nonzero flags are rejected.
+
 | Distro family | Authoritative TLS bundle | Local anchor directory | Update utility |
 | --- | --- | --- | --- |
 | Ubuntu / Debian | `/etc/ssl/certs/ca-certificates.crt` | `/usr/local/share/ca-certificates` | `/usr/sbin/update-ca-certificates --fresh` |

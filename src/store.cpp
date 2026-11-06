@@ -347,6 +347,16 @@ struct Context {
 std::unordered_map<HCERTSTORE, std::shared_ptr<Store>> stores;
 std::unordered_map<PCCERT_CONTEXT, std::unique_ptr<Context>> contexts;
 
+struct OwnedChain {
+    CERT_CHAIN_CONTEXT public_context{};
+    CERT_SIMPLE_CHAIN simple{};
+    std::vector<CERT_SIMPLE_CHAIN*> chain_pointers;
+    std::vector<CERT_CHAIN_ELEMENT> elements;
+    std::vector<CERT_CHAIN_ELEMENT*> element_pointers;
+    std::vector<PCCERT_CONTEXT> contexts;
+};
+std::unordered_map<PCCERT_CHAIN_CONTEXT, std::unique_ptr<OwnedChain>> chains;
+
 std::shared_ptr<Store> get_store(HCERTSTORE handle) {
     auto found = stores.find(handle);
     require(found != stores.end(), ERROR_INVALID_HANDLE, "Invalid or closed certificate store handle");
@@ -377,6 +387,151 @@ PCCERT_CONTEXT publish(std::unique_ptr<Context> context, std::shared_ptr<Store> 
     context->row = row;
     contexts.emplace(result, std::move(context));
     return result;
+}
+
+std::unique_ptr<Context> load_context(Store& store, sqlite3_int64 row);
+void materialize(Store& store, bool create);
+void scoped_backing(Store& store, const std::filesystem::path& directory, DWORD flags);
+std::shared_ptr<Store> machine_backing(const std::string& name, DWORD flags);
+std::filesystem::path user_data_directory();
+
+using Fingerprint = std::array<BYTE, 32>;
+struct ChainCertificate {
+    Bytes der;
+    X509Ptr certificate{nullptr, X509_free};
+
+    explicit ChainCertificate(Bytes input) : der(std::move(input)) {
+        const auto* cursor = der.data();
+        certificate.reset(d2i_X509(nullptr, &cursor, static_cast<long>(der.size())));
+        require(certificate && cursor == der.data() + der.size(), ERROR_INVALID_DATA,
+            "Invalid DER certificate in chain candidate");
+    }
+    ChainCertificate(ChainCertificate&&) noexcept = default;
+    ChainCertificate& operator=(ChainCertificate&&) noexcept = default;
+    ChainCertificate(const ChainCertificate&) = delete;
+    ChainCertificate& operator=(const ChainCertificate&) = delete;
+};
+
+Fingerprint fingerprint(X509* certificate) {
+    Fingerprint result{};
+    unsigned size = 0;
+    require(X509_digest(certificate, EVP_sha256(), result.data(), &size) == 1 &&
+        size == result.size(), ERROR_GEN_FAILURE, "Cannot compute certificate fingerprint");
+    return result;
+}
+bool verifies(X509* certificate, X509* issuer) {
+    auto* key = X509_get0_pubkey(issuer);
+    return key && X509_verify(certificate, key) == 1;
+}
+bool same_name(X509_NAME* left, X509_NAME* right) {
+    int left_size = i2d_X509_NAME(left, nullptr);
+    int right_size = i2d_X509_NAME(right, nullptr);
+    require(left_size > 0 && right_size > 0, ERROR_INVALID_DATA, "Cannot encode certificate name");
+    if (left_size != right_size) return false;
+    Bytes left_der(static_cast<std::size_t>(left_size));
+    Bytes right_der(static_cast<std::size_t>(right_size));
+    auto* left_cursor = left_der.data();
+    auto* right_cursor = right_der.data();
+    require(i2d_X509_NAME(left, &left_cursor) == left_size &&
+        i2d_X509_NAME(right, &right_cursor) == right_size,
+        ERROR_INVALID_DATA, "Cannot encode certificate name");
+    return left_der == right_der;
+}
+bool self_signed(X509* certificate) {
+    return same_name(X509_get_subject_name(certificate), X509_get_issuer_name(certificate)) &&
+        verifies(certificate, certificate);
+}
+void append_chain_candidates(std::vector<ChainCertificate>& result, Store& view) {
+    std::vector<Store*> sources{&view};
+    for (const auto& source : view.inherited) sources.push_back(source.get());
+    for (auto* source : sources) {
+        materialize(*source, false);
+        Statement query(source->db->value, "SELECT id FROM certificates ORDER BY id");
+        while (query.step()) {
+            auto context = load_context(*source, sqlite3_column_int64(query.value, 0));
+            result.emplace_back(context->der);
+        }
+    }
+}
+std::vector<ChainCertificate> chain_candidates(HCERTSTORE handle) {
+    std::vector<ChainCertificate> result;
+    if (handle) append_chain_candidates(result, *get_store(handle));
+    return result;
+}
+std::vector<ChainCertificate> system_chain_candidates(const char* name) {
+    auto view = std::make_shared<Store>();
+    view->name = name;
+    view->location = CERT_SYSTEM_STORE_CURRENT_USER;
+    view->readonly = true;
+    scoped_backing(*view, user_data_directory(), CERT_STORE_READONLY_FLAG);
+    view->inherited.push_back(machine_backing(name, CERT_STORE_READONLY_FLAG));
+    std::vector<ChainCertificate> result;
+    append_chain_candidates(result, *view);
+    return result;
+}
+void insert_chain_candidates(std::map<Fingerprint, ChainCertificate>& destination,
+    std::vector<ChainCertificate> source) {
+    for (auto& certificate : source)
+        destination.try_emplace(fingerprint(certificate.certificate.get()), std::move(certificate));
+}
+std::pair<std::vector<CERT_TRUST_STATUS>, CERT_TRUST_STATUS> chain_statuses(
+    const std::vector<X509*>& certificates, const std::set<Fingerprint>& trusted_roots,
+    const std::set<std::size_t>& invalid_signatures, bool partial, bool cyclic) {
+    std::vector<CERT_TRUST_STATUS> elements(certificates.size());
+    for (std::size_t index = 0; index < certificates.size(); ++index) {
+        auto* certificate = certificates[index];
+        if (X509_cmp_current_time(X509_get0_notBefore(certificate)) > 0 ||
+            X509_cmp_current_time(X509_get0_notAfter(certificate)) < 0)
+            elements[index].dwErrorStatus |= CERT_TRUST_IS_NOT_TIME_VALID;
+        if (invalid_signatures.contains(index))
+            elements[index].dwErrorStatus |= CERT_TRUST_IS_NOT_SIGNATURE_VALID;
+        if (self_signed(certificate))
+            elements[index].dwInfoStatus |= CERT_TRUST_IS_SELF_SIGNED;
+        if (index == 0) continue;
+
+        std::unique_ptr<BASIC_CONSTRAINTS, decltype(&BASIC_CONSTRAINTS_free)> constraints(
+            static_cast<BASIC_CONSTRAINTS*>(X509_get_ext_d2i(
+                certificate, NID_basic_constraints, nullptr, nullptr)), BASIC_CONSTRAINTS_free);
+        bool is_ca = constraints && constraints->ca;
+        if (!is_ca)
+            elements[index].dwErrorStatus |=
+                CERT_TRUST_INVALID_BASIC_CONSTRAINTS | CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
+
+        std::unique_ptr<ASN1_BIT_STRING, decltype(&ASN1_BIT_STRING_free)> usage(
+            static_cast<ASN1_BIT_STRING*>(X509_get_ext_d2i(
+                certificate, NID_key_usage, nullptr, nullptr)), ASN1_BIT_STRING_free);
+        if (usage && ASN1_BIT_STRING_get_bit(usage.get(), 5) == 0)
+            elements[index].dwErrorStatus |= CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
+
+        if (constraints && constraints->ca && constraints->pathlen) {
+            auto limit = ASN1_INTEGER_get(constraints->pathlen);
+            require(limit >= 0, ERROR_INVALID_DATA, "Invalid negative CA path-length constraint");
+            long subordinate_ca_count = 0;
+            for (std::size_t subordinate = 1; subordinate < index; ++subordinate) {
+                auto* candidate = certificates[subordinate];
+                std::unique_ptr<BASIC_CONSTRAINTS, decltype(&BASIC_CONSTRAINTS_free)> candidate_constraints(
+                    static_cast<BASIC_CONSTRAINTS*>(X509_get_ext_d2i(
+                        candidate, NID_basic_constraints, nullptr, nullptr)), BASIC_CONSTRAINTS_free);
+                if (candidate_constraints && candidate_constraints->ca &&
+                    !same_name(X509_get_subject_name(candidate), X509_get_issuer_name(candidate)))
+                    ++subordinate_ca_count;
+            }
+            if (subordinate_ca_count > limit)
+                elements[index].dwErrorStatus |= CERT_TRUST_INVALID_BASIC_CONSTRAINTS;
+        }
+    }
+
+    CERT_TRUST_STATUS chain{};
+    if (partial) chain.dwErrorStatus |= CERT_TRUST_IS_PARTIAL_CHAIN;
+    else if (cyclic) chain.dwErrorStatus |= CERT_TRUST_IS_CYCLIC;
+    else if (!certificates.empty() && self_signed(certificates.back()) &&
+        !trusted_roots.contains(fingerprint(certificates.back())))
+        elements.back().dwErrorStatus |= CERT_TRUST_IS_UNTRUSTED_ROOT;
+    for (const auto& status : elements) {
+        chain.dwErrorStatus |= status.dwErrorStatus;
+        chain.dwInfoStatus |= status.dwInfoStatus;
+    }
+    return {std::move(elements), chain};
 }
 
 std::string object_id() {
@@ -1494,6 +1649,158 @@ BOOL CertSaveStore(HCERTSTORE handle, DWORD encoding, DWORD saveAs, DWORD saveTo
         require(i2d_PKCS7(message.get(), &cursor) == size, ERROR_GEN_FAILURE, "PKCS#7 encoding failed");
         auto& output = *static_cast<CRYPT_DATA_BLOB*>(parameter);
         copy_out(encoded, output.pbData, &output.cbData);
+        return TRUE;
+    });
+}
+BOOL CertGetCertificateChain(HCERTCHAINENGINE chainEngine, PCCERT_CONTEXT certificate,
+    const FILETIME* time, HCERTSTORE additionalStore, const CERT_CHAIN_PARA* parameters,
+    DWORD flags, void* reserved, PCCERT_CHAIN_CONTEXT* chainContext) noexcept {
+    if (chainContext) *chainContext = nullptr;
+    return boundary<BOOL>(FALSE, [&] {
+        require(!chainEngine && !time && flags == 0 && !reserved && parameters && chainContext,
+            ERROR_NOT_SUPPORTED, "Only default offline certificate-chain construction is supported");
+        require(parameters->cbSize == sizeof(*parameters) &&
+            parameters->RequestedUsage.Usage.cUsageIdentifier == 0 &&
+            parameters->RequestedIssuancePolicy.Usage.cUsageIdentifier == 0 &&
+            parameters->dwUrlRetrievalTimeout == 0 &&
+            parameters->fCheckRevocationFreshnessTime == FALSE &&
+            parameters->dwRevocationFreshnessTime == 0 &&
+            !parameters->pftCacheResync && !parameters->pStrongSignPara &&
+            parameters->dwStrongSignFlags == 0,
+            ERROR_NOT_SUPPORTED, "Certificate-chain parameters are unsupported");
+
+        auto& leaf = get_context(certificate);
+        auto roots = system_chain_candidates("ROOT");
+        std::set<Fingerprint> trusted_roots;
+        for (const auto& root : roots)
+            trusted_roots.insert(fingerprint(root.certificate.get()));
+        std::map<Fingerprint, ChainCertificate> candidates;
+        insert_chain_candidates(candidates, chain_candidates(additionalStore));
+        insert_chain_candidates(candidates, system_chain_candidates("CA"));
+        insert_chain_candidates(candidates, std::move(roots));
+
+        std::vector<X509*> certificates{leaf.certificate.get()};
+        std::set<Fingerprint> seen{fingerprint(leaf.certificate.get())};
+        std::set<std::size_t> invalid_signatures;
+        auto* current = leaf.certificate.get();
+        bool partial = false;
+        bool cyclic = false;
+        while (!self_signed(current)) {
+            std::map<Fingerprint, X509*> issuers;
+            std::map<Fingerprint, X509*> name_matches;
+            for (const auto& [hash, candidate] : candidates) {
+                auto* value = candidate.certificate.get();
+                if (!same_name(X509_get_subject_name(value), X509_get_issuer_name(current)))
+                    continue;
+                name_matches.emplace(hash, value);
+                if (verifies(current, value)) issuers.emplace(hash, value);
+            }
+            bool signature_valid = !issuers.empty();
+            if (!signature_valid) issuers = std::move(name_matches);
+            if (issuers.empty()) {
+                partial = true;
+                break;
+            }
+            auto selected = std::find_if(issuers.begin(), issuers.end(),
+                [&](const auto& item) { return trusted_roots.contains(item.first); });
+            if (selected == issuers.end()) selected = issuers.begin();
+            if (!signature_valid) invalid_signatures.insert(certificates.size() - 1);
+            if (!seen.insert(selected->first).second) {
+                cyclic = true;
+                break;
+            }
+            current = selected->second;
+            certificates.push_back(current);
+        }
+        auto [element_statuses, chain_status] =
+            chain_statuses(certificates, trusted_roots, invalid_signatures, partial, cyclic);
+
+        auto owned = std::make_unique<OwnedChain>();
+        try {
+            ++leaf.references;
+            owned->contexts.push_back(certificate);
+            for (std::size_t index = 1; index < certificates.size(); ++index)
+                owned->contexts.push_back(publish(
+                    std::make_unique<Context>(encode_x509(certificates[index]))));
+
+            owned->elements.resize(owned->contexts.size());
+            owned->element_pointers.reserve(owned->elements.size());
+            for (std::size_t index = 0; index < owned->elements.size(); ++index) {
+                owned->elements[index] = {
+                    sizeof(CERT_CHAIN_ELEMENT), owned->contexts[index], element_statuses[index],
+                    nullptr, nullptr, nullptr, nullptr};
+                owned->element_pointers.push_back(&owned->elements[index]);
+            }
+            owned->simple = {
+                sizeof(CERT_SIMPLE_CHAIN), chain_status, count(owned->element_pointers.size()),
+                owned->element_pointers.data(), nullptr, FALSE, 0};
+            owned->chain_pointers = {&owned->simple};
+            owned->public_context = {
+                sizeof(CERT_CHAIN_CONTEXT), chain_status, 1, owned->chain_pointers.data(),
+                0, nullptr, FALSE, 0, 0, {}};
+            auto* result = &owned->public_context;
+            chains.emplace(result, std::move(owned));
+            *chainContext = result;
+        } catch (...) {
+            if (owned)
+                for (auto context : owned->contexts) release(context);
+            throw;
+        }
+        return TRUE;
+    });
+}
+void CertFreeCertificateChain(PCCERT_CHAIN_CONTEXT chainContext) noexcept {
+    if (!chainContext) return;
+    (void)boundary<int>(0, [&] {
+        auto found = chains.find(chainContext);
+        require(found != chains.end(), ERROR_INVALID_HANDLE, "Invalid or freed certificate chain");
+        auto owned = std::move(found->second);
+        chains.erase(found);
+        for (auto context : owned->contexts) release(context);
+        return 0;
+    });
+}
+BOOL CertVerifyCertificateChainPolicy(LPCSTR policy, PCCERT_CHAIN_CONTEXT chainContext,
+    const CERT_CHAIN_POLICY_PARA* parameters, CERT_CHAIN_POLICY_STATUS* status) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(reinterpret_cast<std::uintptr_t>(policy) == 1 && chainContext && parameters && status,
+            E_INVALIDARG, "Invalid certificate-chain policy arguments");
+        require(chains.contains(chainContext), ERROR_INVALID_HANDLE, "Invalid or freed certificate chain");
+        require(parameters->cbSize == sizeof(*parameters) && parameters->dwFlags == 0 &&
+            !parameters->pvExtraPolicyPara && status->cbSize == sizeof(*status) &&
+            !status->pvExtraPolicyStatus,
+            ERROR_NOT_SUPPORTED, "Certificate-chain policy options are unsupported");
+        const auto* simple = chainContext->rgpChain[0];
+        auto find_element = [&](DWORD trust) {
+            for (DWORD index = 0; index < simple->cElement; ++index)
+                if (simple->rgpElement[index]->TrustStatus.dwErrorStatus & trust)
+                    return static_cast<std::int32_t>(index);
+            return std::int32_t{-1};
+        };
+        auto errors = chainContext->TrustStatus.dwErrorStatus;
+        std::int32_t element = -1;
+        if (errors & CERT_TRUST_IS_UNTRUSTED_ROOT) {
+            status->dwError = CERT_E_UNTRUSTEDROOT;
+            element = find_element(CERT_TRUST_IS_UNTRUSTED_ROOT);
+        } else if (errors & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_CYCLIC)) {
+            status->dwError = CERT_E_CHAINING;
+        } else if (errors & CERT_TRUST_IS_NOT_TIME_VALID) {
+            status->dwError = CERT_E_EXPIRED;
+            element = find_element(CERT_TRUST_IS_NOT_TIME_VALID);
+        } else if (errors & CERT_TRUST_IS_NOT_SIGNATURE_VALID) {
+            status->dwError = TRUST_E_CERT_SIGNATURE;
+            element = find_element(CERT_TRUST_IS_NOT_SIGNATURE_VALID);
+        } else if (errors & CERT_TRUST_IS_NOT_VALID_FOR_USAGE) {
+            status->dwError = CERT_E_WRONG_USAGE;
+            element = find_element(CERT_TRUST_IS_NOT_VALID_FOR_USAGE);
+        } else if (errors & CERT_TRUST_INVALID_BASIC_CONSTRAINTS) {
+            status->dwError = TRUST_E_BASIC_CONSTRAINTS;
+            element = find_element(CERT_TRUST_INVALID_BASIC_CONSTRAINTS);
+        } else {
+            status->dwError = ERROR_SUCCESS;
+        }
+        status->lChainIndex = status->dwError == ERROR_SUCCESS ? -1 : 0;
+        status->lElementIndex = element;
         return TRUE;
     });
 }
