@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 
 namespace scs {
 namespace {
@@ -45,10 +46,8 @@ void report(DWORD code, const char* message) noexcept {
     std::snprintf(last_message.data(), last_message.size(), "%s", message);
 }
 
-template<class R, class F> R boundary(R failure, F&& function) noexcept {
+template<class R, class F> R api_boundary(R failure, F&& function) noexcept {
     try {
-        std::lock_guard lock(api_mutex);
-        initialize_crypto();
         return function();
     } catch (const Error& error) {
         report(error.code, error.what());
@@ -62,6 +61,18 @@ template<class R, class F> R boundary(R failure, F&& function) noexcept {
         report(ERROR_GEN_FAILURE, "Unexpected exception at the C API boundary");
     }
     return failure;
+}
+
+template<class F> auto with_api_lock(F&& function) {
+    std::lock_guard lock(api_mutex);
+    initialize_crypto();
+    return function();
+}
+
+template<class R, class F> R boundary(R failure, F&& function) noexcept {
+    return api_boundary<R>(failure, [&] {
+        return with_api_lock(std::forward<F>(function));
+    });
 }
 
 DWORD count(std::size_t size) {
@@ -1122,28 +1133,32 @@ Bytes encode_x509(X509* certificate) {
     require(i2d_X509(certificate, &cursor) == length, ERROR_INVALID_DATA, "Cannot encode certificate");
     return result;
 }
-std::recursive_mutex& api_gate() noexcept { return api_mutex; }
+void initialize_api() { with_api_lock([] {}); }
 void report_api_failure(DWORD code, const char* message) noexcept { report(code, message); }
-std::filesystem::path current_user_store_directory() { return user_data_directory(); }
+std::filesystem::path current_user_store_directory() {
+    return with_api_lock([] { return user_data_directory(); });
+}
 std::vector<Bytes> read_user_store_certificates(
     const std::filesystem::path& directory, uid_t owner) {
-    std::vector<Bytes> result;
-    for (const auto* name : {"MY", "CA", "ROOT"}) {
-        Store store;
-        store.name = name;
-        store.location = CERT_SYSTEM_STORE_CURRENT_USER;
-        store.readonly = true;
-        store.owner = owner;
-        scoped_backing(store, directory, CERT_STORE_READONLY_FLAG);
-        materialize(store);
-        Statement query(store.db->value, "SELECT id FROM certificates ORDER BY id");
-        while (query.step()) {
-            auto certificate = load_context(
-                store, sqlite3_column_int64(query.value, 0));
-            result.push_back(certificate->der);
+    return with_api_lock([&] {
+        std::vector<Bytes> result;
+        for (const auto* name : {"MY", "CA", "ROOT"}) {
+            Store store;
+            store.name = name;
+            store.location = CERT_SYSTEM_STORE_CURRENT_USER;
+            store.readonly = true;
+            store.owner = owner;
+            scoped_backing(store, directory, CERT_STORE_READONLY_FLAG);
+            materialize(store);
+            Statement query(store.db->value, "SELECT id FROM certificates ORDER BY id");
+            while (query.step()) {
+                auto certificate = load_context(
+                    store, sqlite3_column_int64(query.value, 0));
+                result.push_back(certificate->der);
+            }
         }
-    }
-    return result;
+        return result;
+    });
 }
 } // namespace scs
 
@@ -1186,7 +1201,7 @@ BOOL SysCertGetCertificateStoreLocation(PCCERT_CONTEXT certificate, DWORD* locat
     });
 }
 BOOL CertEnumSystemStoreLocation(DWORD flags, void* argument, PFN_CERT_ENUM_SYSTEM_STORE_LOCATION callback) noexcept {
-    return boundary<BOOL>(FALSE, [&] {
+    return api_boundary<BOOL>(FALSE, [&] {
         require(flags == 0, ERROR_NOT_SUPPORTED, "System-store location enumeration flags are unsupported");
         require(callback, E_INVALIDARG, "Missing location enumeration callback");
         if (!callback(L"CurrentUser", CERT_SYSTEM_STORE_CURRENT_USER, nullptr, argument)) return FALSE;
@@ -1194,13 +1209,15 @@ BOOL CertEnumSystemStoreLocation(DWORD flags, void* argument, PFN_CERT_ENUM_SYST
     });
 }
 BOOL CertEnumSystemStore(DWORD flags, void* locationParameter, void* argument, PFN_CERT_ENUM_SYSTEM_STORE callback) noexcept {
-    return boundary<BOOL>(FALSE, [&] {
+    return api_boundary<BOOL>(FALSE, [&] {
         require(flags == CERT_SYSTEM_STORE_CURRENT_USER || flags == CERT_SYSTEM_STORE_LOCAL_MACHINE,
             ERROR_NOT_SUPPORTED, "Only current-user and computer store enumeration is supported");
         require(!locationParameter, ERROR_NOT_SUPPORTED, "Remote and relocated Win32 enumeration parameters are unsupported");
         require(callback, E_INVALIDARG, "Missing store enumeration callback");
         std::set<std::string> names{"ROOT", "CA", "MY"};
-        auto directory = flags == CERT_SYSTEM_STORE_CURRENT_USER ? user_data_directory() : system_paths.machine;
+        auto directory = with_api_lock([&] {
+            return flags == CERT_SYSTEM_STORE_CURRENT_USER ? user_data_directory() : system_paths.machine;
+        });
         if (std::filesystem::exists(directory)) {
             for (const auto& entry : std::filesystem::directory_iterator(directory)) {
                 if (entry.is_symlink() || !entry.is_regular_file() || entry.path().extension() != ".db") continue;

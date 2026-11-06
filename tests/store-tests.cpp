@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <arpa/inet.h>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <iostream>
 #include <memory>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pwd.h>
 #include <set>
 #include <sstream>
@@ -203,6 +205,8 @@ std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> make_crl(
 struct HttpServer {
     int socket = -1;
     pid_t child = -1;
+    int request_ready = -1;
+    int response_release = -1;
     unsigned short port = 0;
     HttpServer() {
         socket = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -218,15 +222,32 @@ struct HttpServer {
         port = ntohs(address.sin_port);
         CHECK(listen(socket, 1) == 0);
     }
-    void start(const std::vector<BYTE>& body) {
+    void start(const std::vector<BYTE>& body, bool block_response = false) {
+        int ready_pipe[2]{-1, -1};
+        int release_pipe[2]{-1, -1};
+        if (block_response) {
+            CHECK(pipe2(ready_pipe, O_CLOEXEC) == 0);
+            CHECK(pipe2(release_pipe, O_CLOEXEC) == 0);
+        }
         child = fork();
         CHECK(child >= 0);
         if (child == 0) {
             alarm(15);
+            if (block_response) {
+                close(ready_pipe[0]);
+                close(release_pipe[1]);
+            }
             int client = accept4(socket, nullptr, nullptr, SOCK_CLOEXEC);
             if (client < 0) _exit(1);
             std::array<char, 4096> request{};
             if (read(client, request.data(), request.size()) <= 0) _exit(2);
+            if (block_response) {
+                char signal = 1;
+                if (write(ready_pipe[1], &signal, 1) != 1) _exit(4);
+                close(ready_pipe[1]);
+                if (read(release_pipe[0], &signal, 1) != 1) _exit(5);
+                close(release_pipe[0]);
+            }
             std::string header = "HTTP/1.0 200 OK\r\nContent-Type: application/pkix-crl\r\nContent-Length: " +
                 std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
             auto send_all = [&](const void* input, std::size_t length) {
@@ -244,8 +265,32 @@ struct HttpServer {
             close(socket);
             _exit(0);
         }
+        if (block_response) {
+            close(ready_pipe[1]);
+            close(release_pipe[0]);
+            request_ready = ready_pipe[0];
+            response_release = release_pipe[1];
+        }
         close(socket);
         socket = -1;
+    }
+    bool wait_for_request() {
+        if (request_ready < 0) return false;
+        pollfd descriptor{request_ready, POLLIN, 0};
+        bool ready = poll(&descriptor, 1, 5000) == 1 && (descriptor.revents & POLLIN);
+        char signal = 0;
+        bool received = ready && read(request_ready, &signal, 1) == 1;
+        close(request_ready);
+        request_ready = -1;
+        return received;
+    }
+    bool release_response() {
+        if (response_release < 0) return false;
+        char signal = 1;
+        bool released = write(response_release, &signal, 1) == 1;
+        close(response_release);
+        response_release = -1;
+        return released;
     }
     void wait() {
         if (child <= 0) return;
@@ -256,12 +301,25 @@ struct HttpServer {
     }
     ~HttpServer() {
         if (socket >= 0) close(socket);
+        if (request_ready >= 0) close(request_ready);
+        if (response_release >= 0) {
+            char signal = 1;
+            auto ignored = write(response_release, &signal, 1);
+            (void)ignored;
+            close(response_release);
+        }
         if (child > 0) {
             int status = 0;
             waitpid(child, &status, 0);
         }
     }
 };
+bool wait_for_flag(const std::atomic<bool>& flag, std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!flag.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return flag.load();
+}
 PCCERT_CONTEXT create(const Bytes& encoded) {
     return CertCreateCertificateContext(X509_ASN_ENCODING, encoded.data(), static_cast<DWORD>(encoded.size()));
 }
@@ -790,6 +848,17 @@ BOOL collect_locations(LPCWSTR, DWORD location, void* reserved, void* argument) 
     static_cast<std::set<DWORD>*>(argument)->insert(location);
     return TRUE;
 }
+struct BlockingEnumeration {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+};
+BOOL block_store_enumeration(const void*, DWORD, PCERT_SYSTEM_STORE_INFO, void*, void* argument) {
+    auto* state = static_cast<BlockingEnumeration*>(argument);
+    state->entered = true;
+    while (!state->release.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return TRUE;
+}
 DWORD location(PCCERT_CONTEXT certificate) {
     DWORD result = 0;
     CHECK(SysCertGetCertificateStoreLocation(certificate, &result));
@@ -822,6 +891,29 @@ void system_scope_tests() {
         std::set<std::wstring> names;
         CHECK(CertEnumSystemStore(CERT_SYSTEM_STORE_CURRENT_USER, nullptr, &names, collect_stores));
         CHECK(names == std::set<std::wstring>({L"CA", L"MY", L"ROOT"}));
+        BlockingEnumeration enumeration_state;
+        std::atomic<bool> enumeration_result{false};
+        std::thread enumeration([&] {
+            enumeration_result = CertEnumSystemStore(
+                CERT_SYSTEM_STORE_CURRENT_USER, nullptr, &enumeration_state,
+                block_store_enumeration) != FALSE;
+        });
+        bool callback_entered = wait_for_flag(
+            enumeration_state.entered, std::chrono::seconds(5));
+        std::atomic<bool> operation_result{false};
+        std::atomic<bool> operation_finished{false};
+        std::thread operation([&] {
+            auto handle = memory();
+            operation_result = handle && CertCloseStore(handle, 0);
+            operation_finished = true;
+        });
+        bool operation_was_concurrent = wait_for_flag(
+            operation_finished, std::chrono::seconds(2));
+        enumeration_state.release = true;
+        enumeration.join();
+        operation.join();
+        CHECK(callback_entered && operation_was_concurrent &&
+            enumeration_result && operation_result);
         CHECK(!std::filesystem::exists(first_user) && !std::filesystem::exists(machine));
         auto stop = [](const void*, DWORD, PCERT_SYSTEM_STORE_INFO, void*, void*) -> BOOL {
             SetLastError(1234);
@@ -1031,7 +1123,7 @@ void dotnet_crl_cache_tests() {
     auto leaf = make_x509(leaf_key.get(), 202, "CRL Cache Leaf", false,
         issuer.get(), issuer_key.get(), -60, EVP_sha256(), url.c_str());
     auto crl = make_crl(issuer.get(), issuer_key.get());
-    server.start(crl_der(crl.get()));
+    server.start(crl_der(crl.get()), true);
 
     auto user_store = (temp.path / "user-store").string();
     auto machine_store = (temp.path / "machine-store").string();
@@ -1055,8 +1147,27 @@ void dotnet_crl_cache_tests() {
     EnvironmentVariable no_proxy_upper("NO_PROXY", "127.0.0.1,localhost");
     auto* account = getpwuid(geteuid());
     CHECK(account && account->pw_name);
-    CHECK(SysCertPopulateDotNetCrlCache(account->pw_name));
+    std::string account_name(account->pw_name);
+    std::atomic<bool> populate_result{false};
+    std::thread populate([&] {
+        populate_result = SysCertPopulateDotNetCrlCache(account_name.c_str()) != FALSE;
+    });
+    bool request_received = server.wait_for_request();
+    std::atomic<bool> operation_result{false};
+    std::atomic<bool> operation_finished{false};
+    std::thread operation([&] {
+        auto handle = memory();
+        operation_result = handle && CertCloseStore(handle, 0);
+        operation_finished = true;
+    });
+    bool operation_was_concurrent = wait_for_flag(
+        operation_finished, std::chrono::seconds(2));
+    bool response_released = server.release_response();
+    populate.join();
+    operation.join();
     server.wait();
+    CHECK(request_received && response_released && operation_was_concurrent &&
+        operation_result && populate_result);
 
     std::vector<unsigned char> utf16;
     for (auto byte : url) {

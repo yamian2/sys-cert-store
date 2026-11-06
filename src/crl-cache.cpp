@@ -617,8 +617,7 @@ BOOL populate(LPCSTR user_name) {
 
 extern "C" BOOL SysCertPopulateDotNetCrlCache(LPCSTR userName) noexcept {
     try {
-        std::lock_guard lock(scs::api_gate());
-        scs::initialize_crypto();
+        scs::initialize_api();
         return scs::populate(userName);
     } catch (const scs::Error& error) {
         scs::report_api_failure(error.code, error.what());

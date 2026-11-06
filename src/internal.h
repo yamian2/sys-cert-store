@@ -32,7 +32,7 @@ std::vector<Bytes> read_native(const NativeLayout& layout);
 void update_anchor(X509* certificate, bool install, const NativeLayout& layout);
 void remove_trusted_certificate(X509* certificate, const NativeLayout& layout);
 Bytes encode_x509(X509* certificate);
-std::recursive_mutex& api_gate() noexcept;
+void initialize_api();
 void report_api_failure(DWORD code, const char* message) noexcept;
 std::filesystem::path current_user_store_directory();
 std::vector<Bytes> read_user_store_certificates(
