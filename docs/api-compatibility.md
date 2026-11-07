@@ -23,6 +23,7 @@ Supported means the subset described here, not full Windows equivalence.
 | 11 | `CertSaveStore` | Unsigned certificate-only PKCS#7 export to memory; two-call size-query convention. Other output formats/targets fail. |
 | 12 | `CertControlStore` | Immediate SQLite persistence and commit flush; native resync; unsupported controls fail. |
 | 13 | `CertEnumSystemStore`, `CertEnumSystemStoreLocation` | User/computer locations, predefined ROOT/CA/MY and persisted custom-store names; callback early termination. |
+| 16 | `PFXExportCertStoreEx` | Authenticated certificate-only or single-key PKCS#12 export to memory; AES-256-CBC protection and two-call size-query convention. |
 | 16 | `PFXImportCertStore` | Single-key or certificate-only authenticated PKCS#12; creates a persistent import store with PEM certificates and filesystem-protected PKCS#8 key files. |
 
 `GetLastError`, `SetLastError`, `SysCertGetLastErrorMessage` and
@@ -125,6 +126,14 @@ it is not a Crypt32 API.
   file-backed store. It imports the entire supported PFX in one metadata
   transaction and creates separate object directories. Friendly-name bag
   attributes are not yet mapped to Windows properties.
+- PFX export supports `0`, `REPORT_NO_PRIVATE_KEY`,
+  `REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY`, and `EXPORT_PRIVATE_KEYS`.
+  Certificate-only export does not open private-key files. Report flags validate
+  any present key files without including keys. `EXPORT_PRIVATE_KEYS` requires
+  exactly one matching key; zero keys return `CRYPT_E_NOT_FOUND` and multiple
+  keys return `ERROR_NOT_SUPPORTED`. All certificates are included, with the
+  key-bearing certificate first when a key is exported. Arbitrary export
+  parameters and other flags are rejected.
 
 ## Planned entry points
 
@@ -155,8 +164,8 @@ separate set of exports.
 
 The [certutil CLI](../tools/certutil/README.md) exposes the implemented store
 operations and uses OpenSSL for public certificate formats and encrypted PFX
-export. CLI export does not imply that the Windows `PFXExportCertStoreEx` library
-API, Windows key providers, or full certutil command coverage is implemented.
+export. The library implements the documented `PFXExportCertStoreEx` subset;
+Windows key providers and full certutil command coverage remain unimplemented.
 
 Ubuntu 24.04 WSL is the initial exercised environment. The CI workflow also
 targets Red Hat UBI 9 and Azure Linux 3 containers. These jobs establish

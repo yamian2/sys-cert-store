@@ -71,6 +71,11 @@ temporary returned certificate store. Closing it does not delete its files.
 `SysCertGetCertificateFilePath` returns the certificate or key filename.
 Multi-key PFX files and unsupported bag types fail rather than dropping material.
 An import containing certificates alone cannot produce private keys.
+`PFXExportCertStoreEx` exports all certificates using the two-call blob convention.
+Flags `0`, `REPORT_NO_PRIVATE_KEY`, `REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY`, and
+`EXPORT_PRIVATE_KEYS` are supported. Flag `0` never opens private-key files.
+`EXPORT_PRIVATE_KEYS` requires exactly one matching key; multiple exportable keys
+are rejected. Exported key and certificate safes use AES-256-CBC.
 
 `SysCertPopulateDotNetCrlCache` preloads the private CRL cache used by .NET on
 Linux. With a UTF-8 user name, it discovers HTTP CRL distribution points from
@@ -448,6 +453,9 @@ directory with `CRYPT_MACHINE_KEYSET`, unlike Windows'
 temporary returned certificate store. Closing it does not delete its files.
 `SysCertGetCertificateFilePath` returns the certificate or key filename.
 Multi-key PFX files and unsupported bag types fail rather than dropping material.
+`PFXExportCertStoreEx` supports certificate-only and single-private-key exports
+with AES-256-CBC protection. Certificate-only export does not open private-key
+files; key export requires exactly one matching key.
 
 
 Computer `ROOT` exposes system TLS trust, not every certificate found somewhere below

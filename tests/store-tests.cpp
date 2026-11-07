@@ -645,6 +645,84 @@ void pfx_tests() {
     Certificate copied(add(second.value, certificate.value));
     auto copied_key = material_path(copied.value, TRUE);
     CHECK(copied_key != key_file && read_file(copied_key) == read_file(key_file));
+    CRYPT_DATA_BLOB exported{};
+    CHECK(PFXExportCertStoreEx(reopened.value, &exported, L"export-password", nullptr, EXPORT_PRIVATE_KEYS));
+    CHECK(exported.cbData > 0);
+    DWORD required_export_size = exported.cbData;
+    std::vector<BYTE> short_export(required_export_size - 1);
+    exported = {static_cast<DWORD>(short_export.size()), short_export.data()};
+    CHECK(!PFXExportCertStoreEx(reopened.value, &exported, L"export-password", nullptr, EXPORT_PRIVATE_KEYS));
+    CHECK(GetLastError() == ERROR_MORE_DATA && exported.cbData == required_export_size);
+    std::vector<BYTE> export_buffer(exported.cbData);
+    exported.pbData = export_buffer.data();
+    CHECK(PFXExportCertStoreEx(reopened.value, &exported, L"export-password", nullptr, EXPORT_PRIVATE_KEYS));
+    const BYTE* export_cursor = export_buffer.data();
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> exported_pfx(
+        d2i_PKCS12(nullptr, &export_cursor, static_cast<long>(export_buffer.size())), PKCS12_free);
+    CHECK(exported_pfx && export_cursor == export_buffer.data() + export_buffer.size());
+    EVP_PKEY* exported_key_raw = nullptr;
+    X509* exported_leaf_raw = nullptr;
+    STACK_OF(X509)* exported_chain_raw = nullptr;
+    CHECK(PKCS12_parse(exported_pfx.get(), "export-password", &exported_key_raw,
+        &exported_leaf_raw, &exported_chain_raw) == 1);
+    Key exported_key(exported_key_raw, EVP_PKEY_free);
+    X509Handle exported_leaf(exported_leaf_raw, X509_free);
+    std::unique_ptr<STACK_OF(X509), decltype(free_chain)> exported_chain(exported_chain_raw, free_chain);
+    CHECK(exported_key && EVP_PKEY_eq(exported_key.get(), leaf_key.get()) == 1);
+    CHECK(exported_leaf && X509_cmp(exported_leaf.get(), leaf.get()) == 0);
+    CHECK(exported_chain && sk_X509_num(exported_chain.get()) == 1 &&
+        X509_cmp(sk_X509_value(exported_chain.get(), 0), ca.get()) == 0);
+    CHECK(!PFXExportCertStoreEx(reopened.value, nullptr, nullptr, nullptr, 0));
+    CHECK(GetLastError() == E_INVALIDARG);
+    CHECK(!PFXExportCertStoreEx(reopened.value, &exported, nullptr, &exported, 0));
+    CHECK(GetLastError() == ERROR_NOT_SUPPORTED);
+    CHECK(!PFXExportCertStoreEx(reopened.value, &exported, nullptr, nullptr, 8));
+    CHECK(GetLastError() == ERROR_NOT_SUPPORTED);
+    Store empty(memory());
+    CRYPT_DATA_BLOB empty_output{};
+    CHECK(!PFXExportCertStoreEx(empty.value, &empty_output, nullptr, nullptr, 0));
+    CHECK(GetLastError() == CRYPT_E_NOT_FOUND);
+    Store no_key(memory());
+    Certificate ca_context(create(der(ca.get())));
+    Certificate stored_ca(add(no_key.value, ca_context.value));
+    CHECK(!PFXExportCertStoreEx(no_key.value, &empty_output, nullptr, nullptr, EXPORT_PRIVATE_KEYS));
+    CHECK(GetLastError() == CRYPT_E_NOT_FOUND);
+    CHECK(PFXExportCertStoreEx(no_key.value, &empty_output, nullptr, nullptr, REPORT_NO_PRIVATE_KEY));
+    auto multiple_path = (temp.path / "multiple.db").string();
+    Store multiple(CertOpenStore(SYS_CERT_STORE_PROV_SQLITE, 0, 0, 0, multiple_path.c_str()));
+    CHECK(SysCertImportPfxToStore(multiple.value, &blob, L"password", 0));
+    auto second_key = key();
+    auto second_leaf = make_x509(second_key.get(), 3, "Second PFX leaf", false);
+    auto second_encoded = pfx_bytes(second_leaf.get(), second_key.get());
+    CRYPT_DATA_BLOB second_blob{static_cast<DWORD>(second_encoded.size()), second_encoded.data()};
+    CHECK(SysCertImportPfxToStore(multiple.value, &second_blob, L"password", 0));
+    CHECK(!PFXExportCertStoreEx(multiple.value, &empty_output, nullptr, nullptr, EXPORT_PRIVATE_KEYS));
+    CHECK(GetLastError() == ERROR_NOT_SUPPORTED);
+
+    write_file(key_file, "corrupt private key");
+    CRYPT_DATA_BLOB certificate_only{};
+    CHECK(PFXExportCertStoreEx(reopened.value, &certificate_only, nullptr, nullptr, 0));
+    std::vector<BYTE> certificate_buffer(certificate_only.cbData);
+    certificate_only.pbData = certificate_buffer.data();
+    CHECK(PFXExportCertStoreEx(reopened.value, &certificate_only, nullptr, nullptr, 0));
+    const BYTE* certificate_cursor = certificate_buffer.data();
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> certificate_pfx(
+        d2i_PKCS12(nullptr, &certificate_cursor, static_cast<long>(certificate_buffer.size())), PKCS12_free);
+    CHECK(certificate_pfx);
+    EVP_PKEY* absent_key_raw = nullptr;
+    X509* certificate_leaf_raw = nullptr;
+    STACK_OF(X509)* certificate_chain_raw = nullptr;
+    CHECK(PKCS12_parse(certificate_pfx.get(), "", &absent_key_raw,
+        &certificate_leaf_raw, &certificate_chain_raw) == 1);
+    Key absent_key(absent_key_raw, EVP_PKEY_free);
+    X509Handle certificate_leaf(certificate_leaf_raw, X509_free);
+    std::unique_ptr<STACK_OF(X509), decltype(free_chain)> certificate_chain(
+        certificate_chain_raw, free_chain);
+    CHECK(!absent_key);
+    CHECK((certificate_leaf ? 1 : 0) + sk_X509_num(certificate_chain.get()) == 2);
+    CHECK(!PFXExportCertStoreEx(reopened.value, &exported, nullptr, nullptr,
+        REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY));
+    CHECK(GetLastError() == ERROR_INVALID_DATA);
     CHECK(CertDeleteCertificateFromStore(CertDuplicateCertificateContext(certificate.value)));
     CHECK(!std::filesystem::exists(key_file) && !std::filesystem::exists(cert_file));
     CHECK(std::filesystem::exists(copied_key));
@@ -1707,6 +1785,27 @@ void pqc_tests() {
         Key recovered(PEM_read_PrivateKey(input.get(), nullptr, nullptr, nullptr), EVP_PKEY_free);
         CHECK(recovered && EVP_PKEY_eq(recovered.get(), subject_key.get()) == 1);
         CHECK(std::strcmp(OSSL_PROVIDER_get0_name(EVP_PKEY_get0_provider(recovered.get())), "symcryptprovider") == 0);
+        CRYPT_DATA_BLOB exported{};
+        CHECK(PFXExportCertStoreEx(reopened.value, &exported, L"password", nullptr, EXPORT_PRIVATE_KEYS));
+        std::vector<BYTE> exported_bytes(exported.cbData);
+        exported.pbData = exported_bytes.data();
+        CHECK(PFXExportCertStoreEx(reopened.value, &exported, L"password", nullptr, EXPORT_PRIVATE_KEYS));
+        const BYTE* exported_cursor = exported_bytes.data();
+        std::unique_ptr<PKCS12, decltype(&PKCS12_free)> exported_pfx(
+            d2i_PKCS12(nullptr, &exported_cursor, static_cast<long>(exported_bytes.size())), PKCS12_free);
+        CHECK(exported_pfx);
+        EVP_PKEY* exported_key_raw = nullptr;
+        X509* exported_leaf_raw = nullptr;
+        STACK_OF(X509)* exported_chain_raw = nullptr;
+        CHECK(PKCS12_parse(exported_pfx.get(), "password", &exported_key_raw,
+            &exported_leaf_raw, &exported_chain_raw) == 1);
+        Key exported_key(exported_key_raw, EVP_PKEY_free);
+        X509Handle exported_leaf(exported_leaf_raw, X509_free);
+        auto free_exported_chain = [](STACK_OF(X509)* value) { sk_X509_pop_free(value, X509_free); };
+        std::unique_ptr<STACK_OF(X509), decltype(free_exported_chain)> exported_chain(
+            exported_chain_raw, free_exported_chain);
+        CHECK(exported_key && EVP_PKEY_eq(exported_key.get(), subject_key.get()) == 1);
+        CHECK(exported_leaf && X509_cmp(exported_leaf.get(), leaf.get()) == 0);
         auto signed_again = make_x509(recovered.get(), 3, "Reloaded PQC", true, nullptr, nullptr, -60, nullptr);
         CHECK(X509_verify(signed_again.get(), subject_key.get()) == 1);
         CHECK(CertDeleteCertificateFromStore(CertDuplicateCertificateContext(stored.value)));

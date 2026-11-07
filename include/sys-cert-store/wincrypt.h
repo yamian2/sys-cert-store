@@ -196,6 +196,9 @@ inline constexpr DWORD CRYPT_EXPORTABLE = 1;
 inline constexpr DWORD CRYPT_USER_KEYSET = 0x1000;
 inline constexpr DWORD CRYPT_MACHINE_KEYSET = 0x20;
 inline constexpr DWORD PKCS12_NO_PERSIST_KEY = 0x8000;
+inline constexpr DWORD REPORT_NO_PRIVATE_KEY = 1;
+inline constexpr DWORD REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY = 2;
+inline constexpr DWORD EXPORT_PRIVATE_KEYS = 4;
 #define CERT_CHAIN_POLICY_BASE reinterpret_cast<LPCSTR>(1)
 inline constexpr DWORD CERT_TRUST_IS_NOT_TIME_VALID = 0x00000001;
 inline constexpr DWORD CERT_TRUST_IS_NOT_SIGNATURE_VALID = 0x00000008;
@@ -271,6 +274,8 @@ BOOL CertGetCertificateChain(HCERTCHAINENGINE chainEngine, PCCERT_CONTEXT certif
 void CertFreeCertificateChain(PCCERT_CHAIN_CONTEXT chainContext) noexcept;
 BOOL CertVerifyCertificateChainPolicy(LPCSTR policy, PCCERT_CHAIN_CONTEXT chainContext,
     const CERT_CHAIN_POLICY_PARA* parameters, CERT_CHAIN_POLICY_STATUS* status) noexcept;
+BOOL PFXExportCertStoreEx(HCERTSTORE store, CRYPT_DATA_BLOB* pfx, LPCWSTR password,
+    void* parameter, DWORD flags) noexcept;
 HCERTSTORE PFXImportCertStore(CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flags) noexcept;
 }
 

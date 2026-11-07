@@ -1278,6 +1278,67 @@ void import_pfx(Store& store, std::vector<std::unique_ptr<Context>>& certificate
     transaction.commit();
     for (auto& object : objects) object->committed = true;
 }
+std::vector<std::unique_ptr<Context>> export_contexts(Store& store, bool load_keys) {
+    std::vector<std::unique_ptr<Context>> result;
+    auto append = [&](Store& source) {
+        materialize(source);
+        Statement query(source.db->value, "SELECT id FROM certificates ORDER BY id");
+        while (query.step()) {
+            auto context = load_context(source, sqlite3_column_int64(query.value, 0));
+            if (load_keys) load_private_key(*context);
+            result.push_back(std::move(context));
+        }
+    };
+    append(store);
+    for (const auto& source : store.inherited) append(*source);
+    require(!result.empty(), CRYPT_E_NOT_FOUND, "Certificate store is empty");
+    return result;
+}
+Bytes encode_pfx(Store& store, LPCWSTR password, DWORD flags) {
+    constexpr DWORD supported = REPORT_NO_PRIVATE_KEY |
+        REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY | EXPORT_PRIVATE_KEYS;
+    require((flags & ~supported) == 0, ERROR_NOT_SUPPORTED, "PKCS#12 export flags are unsupported");
+    bool inspect_keys = (flags & supported) != 0;
+    auto contexts = export_contexts(store, inspect_keys);
+    std::vector<std::size_t> key_indices;
+    for (std::size_t i = 0; i < contexts.size(); ++i)
+        if (contexts[i]->private_key) key_indices.push_back(i);
+    bool export_key = (flags & EXPORT_PRIVATE_KEYS) != 0;
+    if (export_key) {
+        require(!key_indices.empty(), CRYPT_E_NOT_FOUND, "Certificate store contains no private key");
+        require(key_indices.size() == 1, ERROR_NOT_SUPPORTED,
+            "PKCS#12 export with multiple private keys is unsupported");
+    }
+
+    auto secret = password ? utf8(password) : std::string{};
+    struct CleanseString {
+        std::string& value;
+        ~CleanseString() { OPENSSL_cleanse(value.data(), value.size()); }
+    } cleanse_secret{secret};
+    require(secret.size() <= static_cast<std::size_t>(INT_MAX), E_INVALIDARG, "PKCS#12 password is too long");
+
+    auto free_chain = [](STACK_OF(X509)* value) { sk_X509_free(value); };
+    std::unique_ptr<STACK_OF(X509), decltype(free_chain)> chain(sk_X509_new_null(), free_chain);
+    require(chain != nullptr, ERROR_NOT_ENOUGH_MEMORY, "Cannot allocate PKCS#12 certificate stack");
+    std::size_t primary = export_key ? key_indices.front() : contexts.size();
+    for (std::size_t i = 0; i < contexts.size(); ++i) {
+        if (i == primary) continue;
+        require(sk_X509_push(chain.get(), contexts[i]->certificate.get()) != 0,
+            ERROR_NOT_ENOUGH_MEMORY, "Cannot add certificate to PKCS#12 export");
+    }
+    EVP_PKEY* key = export_key ? contexts[primary]->private_key.get() : nullptr;
+    X509* certificate = export_key ? contexts[primary]->certificate.get() : nullptr;
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> pfx(
+        PKCS12_create(secret.c_str(), export_key ? "sys-cert-store" : nullptr, key, certificate, chain.get(),
+            NID_aes_256_cbc, NID_aes_256_cbc, 0, 0, 0), PKCS12_free);
+    require(pfx != nullptr, ERROR_GEN_FAILURE, "Cannot create PKCS#12 export");
+    int size = i2d_PKCS12(pfx.get(), nullptr);
+    require(size > 0, ERROR_GEN_FAILURE, "Cannot encode PKCS#12 export");
+    Bytes encoded(static_cast<std::size_t>(size));
+    auto* cursor = encoded.data();
+    require(i2d_PKCS12(pfx.get(), &cursor) == size, ERROR_GEN_FAILURE, "Cannot encode PKCS#12 export");
+    return encoded;
+}
 } // namespace
 
 Bytes encode_x509(X509* certificate) {
@@ -1842,6 +1903,20 @@ HCERTSTORE PFXImportCertStore(CRYPT_DATA_BLOB* pfx, LPCWSTR password, DWORD flag
         persistent_store(*store, directory / (store->name + ".db"), CERT_STORE_CREATE_NEW_FLAG);
         import_pfx(*store, parsed);
         return publish_store(std::move(store));
+    });
+}
+BOOL PFXExportCertStoreEx(HCERTSTORE handle, CRYPT_DATA_BLOB* pfx, LPCWSTR password,
+    void* parameter, DWORD flags) noexcept {
+    return boundary<BOOL>(FALSE, [&] {
+        require(pfx, E_INVALIDARG, "Missing PKCS#12 output blob");
+        require(!parameter, ERROR_NOT_SUPPORTED, "PKCS#12 export parameter is unsupported");
+        auto encoded = encode_pfx(*get_store(handle), password, flags);
+        struct CleanseBytes {
+            Bytes& value;
+            ~CleanseBytes() { OPENSSL_cleanse(value.data(), value.size()); }
+        } cleanse{encoded};
+        copy_out(encoded, pfx->pbData, &pfx->cbData);
+        return TRUE;
     });
 }
 BOOL SysCertGetCertificateFilePath(PCCERT_CONTEXT certificate, BOOL privateKey, char* path, DWORD* size) noexcept {
